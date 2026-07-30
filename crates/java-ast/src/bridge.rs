@@ -65,6 +65,7 @@ impl JavaParser for CliParser {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut unit: CompilationUnit = serde_json::from_str(&stdout)?;
         unit.source_file = filename.to_string();
+        unit.raw_json = stdout.to_string();
         Ok(unit)
     }
 }

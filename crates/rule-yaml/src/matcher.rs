@@ -620,6 +620,7 @@ mod tests {
             ],
             source_file: "Test.java".to_string(),
             source_lines: vec![],
+            raw_json: String::new(),
         }
     }
 

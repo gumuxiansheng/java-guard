@@ -1,7 +1,5 @@
-//! 内置规则 J008：检测空 catch 块。
-//!
-//! 空 catch 块会吞掉异常，是常见的代码缺陷。
-
+//! 内置规则 J008：检测空 catch 块�?//!
+//! �?catch 块会吞掉异常，是常见的代码缺陷�?
 use guard_core::rule::{Rule, RuleId, Severity, Violation};
 use java_ast::ast::{CompilationUnit, MemberDecl, Stmt, TypeDecl};
 
@@ -185,6 +183,7 @@ mod tests {
             })],
             source_file: make_violation_file(),
             source_lines: vec![],
+            raw_json: String::new(),
         };
 
         let rule = EmptyCatchRule::new();
@@ -251,6 +250,7 @@ mod tests {
             })],
             source_file: make_violation_file(),
             source_lines: vec![],
+            raw_json: String::new(),
         };
 
         let rule = EmptyCatchRule::new();

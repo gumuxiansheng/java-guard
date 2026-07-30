@@ -1,0 +1,74 @@
+﻿cargo :    Compiling rule-rhai v0.1.0 (C:\Dev\Projects\java-guard\crates\rule-rhai)
+所在位置 行:1 字符: 122
++ ... lvm-jdk-22.0.2+9.1\bin\java.exe"; cargo test --workspace 2>&1 | Out-F ...
++                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling ru...ates\rule-rhai):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: use of deprecated method `rhai::api::deprecated::<impl rhai::Dynamic>::as_string`: use `into_string` instead
+   --> crates\rule-rhai\src\engine.rs:155:37
+    |
+155 |             .and_then(|v| v.clone().as_string().ok())
+    |                                     ^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `end_line`
+   --> crates\rule-rhai\src\engine.rs:148:13
+    |
+148 |         let end_line = map
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_end_line`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+error: reached the recursion limit while instantiating `serialize_tagged_newtype::<TaggedSerializer<...>, ...>`
+   --> crates\java-ast\src\ast.rs:394:24
+    |
+394 | #[derive(Debug, Clone, Serialize, Deserialize)]
+    |                        ^^^^^^^^^
+    |
+note: `_serde::__private229::ser::serialize_tagged_newtype` defined here
+   --> C:\Users\win11\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\serde-1.0.229\src\private\ser.rs:17:1
+    |
+ 17 | / pub fn serialize_tagged_newtype<S, T>(
+ 18 | |     serializer: S,
+ 19 | |     type_ident: &'static str,
+ 20 | |     variant_ident: &'static str,
+...   |
+ 26 | |     S: Serializer,
+ 27 | |     T: Serialize,
+    | |_________________^
+    = note: the full name for the type has been written to 'C:\Dev\Projects\java-guard\target\debug\deps\rule_rhai-c83c
+a9efc9ebe085.long-type-13576642817654198675.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+    = note: this error originates in the derive macro `Serialize` (in Nightly builds, run with -Z macro-backtrace for m
+ore info)
+
+warning: `rule-rhai` (lib) generated 2 warnings
+error: could not compile `rule-rhai` (lib) due to 1 previous error; 2 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+error: reached the recursion limit while instantiating `serialize_tagged_newtype::<TaggedSerializer<...>, ...>`
+   --> crates\java-ast\src\ast.rs:394:24
+    |
+394 | #[derive(Debug, Clone, Serialize, Deserialize)]
+    |                        ^^^^^^^^^
+    |
+note: `_serde::__private229::ser::serialize_tagged_newtype` defined here
+   --> C:\Users\win11\.cargo\registry\src\mirrors.ustc.edu.cn-38d0e5eb5da2abae\serde-1.0.229\src\private\ser.rs:17:1
+    |
+ 17 | / pub fn serialize_tagged_newtype<S, T>(
+ 18 | |     serializer: S,
+ 19 | |     type_ident: &'static str,
+ 20 | |     variant_ident: &'static str,
+...   |
+ 26 | |     S: Serializer,
+ 27 | |     T: Serialize,
+    | |_________________^
+    = note: the full name for the type has been written to 'C:\Dev\Projects\java-guard\target\debug\deps\rule_rhai-988b
+98a3f64626eb.long-type-16007094731939922343.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+    = note: this error originates in the derive macro `Serialize` (in Nightly builds, run with -Z macro-backtrace for m
+ore info)
+
+warning: `rule-rhai` (lib test) generated 2 warnings (2 duplicates)
+error: could not compile `rule-rhai` (lib test) due to 1 previous error; 2 warnings emitted

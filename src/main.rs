@@ -1,3 +1,4 @@
+mod adapters;
 mod rules;
 mod scanner;
 
@@ -11,6 +12,8 @@ use guard_core::rule::{Rule, ViolationCollector};
 use java_ast::ast::CompilationUnit;
 use java_ast::bridge::{CliParser, JavaParser};
 use rule_yaml::YamlRuleAdapter;
+use rule_rhai::rule::RhaiRule;
+use crate::adapters::RhaiRuleAdapter;
 
 #[derive(Parser)]
 #[clap(name = "java-guard", version, about = "Lightweight Java static analysis")]
@@ -110,6 +113,26 @@ fn load_yaml_rules(dir: &Path) -> Vec<rule_yaml::YamlRule> {
     }
 }
 
+fn load_rhai_rules(dir: &Path) -> Result<Vec<RhaiRule>, Box<dyn std::error::Error>> {
+    let mut rules = Vec::new();
+    if !dir.is_dir() {
+        return Ok(rules);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext == "yml" || ext == "yaml" {
+                match rule_rhai::rule::load_rhai_rule_file(&path) {
+                    Ok(r) => rules.push(r),
+                    Err(e) => eprintln!("warn: skip rhai rule {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+    Ok(rules)
+}
+
 fn run_scan(
     path: &str,
     format: &str,
@@ -147,6 +170,21 @@ fn run_scan(
     let yaml_rules = load_yaml_rules(&yaml_dir);
     for yr in yaml_rules {
         rule_list.push(Arc::new(YamlRuleAdapter::new(yr)));
+    }
+
+    // 加载 Rhai 脚本规则
+    let rhai_dir = yaml_dir.join("rhai");
+    if rhai_dir.is_dir() {
+        match load_rhai_rules(&rhai_dir) {
+            Ok(rules) => {
+                for rr in rules {
+                    rule_list.push(Arc::new(RhaiRuleAdapter::new(rr)));
+                }
+            }
+            Err(e) => {
+                eprintln!("warn: failed to load rhai rules: {e}");
+            }
+        }
     }
 
     let enabled_count = rule_list.iter().filter(|r| r.enabled()).count();

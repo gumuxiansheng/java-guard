@@ -1,0 +1,22 @@
+id: J006
+title: "方法不超过 50 行"
+severity: minor
+category: code-smell
+enabled: true
+script: |
+  let violations = [];
+  let types = ast.types;
+  for t in types {
+    for member in t["members"] {
+      if member["kind"] == "MethodDeclaration" {
+        let lines = member["end_line"] - member["line"];
+        if lines > 50 {
+          violations.push(#{
+            line: member["line"],
+            message: "方法长度 " + lines + " 行，超过 50 行限制"
+          });
+        }
+      }
+    }
+  }
+  violations

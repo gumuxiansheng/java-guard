@@ -1,0 +1,55 @@
+﻿cargo :    Compiling rule-rhai v0.1.0 (C:\Dev\Projects\java-guard\crates\rule-rhai)
+所在位置 行:1 字符: 122
++ ... vm-jdk-22.0.2+9.1\bin\java.exe"; cargo test -p rule-rhai 2>&1 | Out-F ...
++                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling ru...ates\rule-rhai):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: use of deprecated method `rhai::api::deprecated::<impl rhai::Dynamic>::as_string`: use `into_string` instead
+   --> crates\rule-rhai\src\engine.rs:171:37
+    |
+171 |             .and_then(|v| v.clone().as_string().ok())
+    |                                     ^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: unused variable: `end_line`
+   --> crates\rule-rhai\src\engine.rs:164:13
+    |
+164 |         let end_line = map
+    |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_end_line`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rule-rhai` (lib) generated 2 warnings (run `cargo fix --lib -p rule-rhai` to apply 1 suggestion)
+warning: `rule-rhai` (lib test) generated 2 warnings (2 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.25s
+     Running unittests src\lib.rs (target\debug\deps\rule_rhai-c179d4acaf9eb909.exe)
+
+running 4 tests
+test rule::tests::parse_rhai_rule ... ok
+test engine::tests::rhai_rule_syntax_error ... ok
+test engine::tests::rhai_rule_long_method ... FAILED
+test engine::tests::rhai_rule_no_violations ... FAILED
+
+failures:
+
+---- engine::tests::rhai_rule_long_method stdout ----
+
+thread 'engine::tests::rhai_rule_long_method' (7080) panicked at crates\rule-rhai\src\engine.rs:253:55:
+called `Result::unwrap()` on an `Err` value: Compile("Expecting ';' to terminate this statement (line 10, position 41)")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- engine::tests::rhai_rule_no_violations stdout ----
+
+thread 'engine::tests::rhai_rule_no_violations' (69900) panicked at crates\rule-rhai\src\engine.rs:290:55:
+called `Result::unwrap()` on an `Err` value: Compile("Expecting ';' to terminate this statement (line 10, position 41)")
+
+
+failures:
+    engine::tests::rhai_rule_long_method
+    engine::tests::rhai_rule_no_violations
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p rule-rhai --lib`

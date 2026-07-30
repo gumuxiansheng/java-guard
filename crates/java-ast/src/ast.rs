@@ -12,6 +12,9 @@ pub struct CompilationUnit {
     pub source_file: String,
     #[serde(default)]
     pub source_lines: Vec<String>,
+    /// 原始 JSON 字符串（用于 Rhai 等需要原始 JSON 的场景）。
+    #[serde(skip)]
+    pub raw_json: String,
 }
 
 /// import 语句。
