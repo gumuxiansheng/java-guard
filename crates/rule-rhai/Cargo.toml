@@ -1,0 +1,10 @@
+[package]
+name = "rule-rhai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+guard-core = { path = "../guard-core" }
+java-ast = { path = "../java-ast" }
+rhai = "1"
+thiserror = { workspace = true }

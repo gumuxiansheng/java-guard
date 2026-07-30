@@ -1,0 +1,12 @@
+[package]
+name = "rule-yaml"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+guard-core = { path = "../guard-core" }
+java-ast = { path = "../java-ast" }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }

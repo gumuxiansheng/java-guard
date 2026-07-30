@@ -1,0 +1,10 @@
+[package]
+name = "java-ast"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+guard-core = { path = "../guard-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "rule-plugin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+guard-core = { path = "../guard-core" }
+java-ast = { path = "../java-ast" }
+thiserror = { workspace = true }
