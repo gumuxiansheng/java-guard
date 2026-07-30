@@ -291,6 +291,7 @@ dependencies = [
  "clap",
  "guard-core",
  "java-ast",
+ "rule-yaml",
  "serde",
  "serde_json",
  "walkdir",

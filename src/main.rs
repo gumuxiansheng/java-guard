@@ -8,7 +8,9 @@ use std::sync::Arc;
 use clap::Parser;
 use guard_core::reporter::{report, ReportFormat};
 use guard_core::rule::{Rule, ViolationCollector};
+use java_ast::ast::CompilationUnit;
 use java_ast::bridge::{CliParser, JavaParser};
+use rule_yaml::YamlRuleAdapter;
 
 #[derive(Parser)]
 #[clap(name = "java-guard", version, about = "Lightweight Java static analysis")]
@@ -37,6 +39,10 @@ enum Command {
         #[clap(short = 'x', long)]
         exclude: Option<String>,
 
+        /// YAML 规则目录（默认 rules/）
+        #[clap(short = 'r', long)]
+        rules_dir: Option<String>,
+
         /// java-parser.jar 路径
         #[clap(long, env = "JAVAGUARD_PARSER_JAR")]
         parser_jar: Option<String>,
@@ -60,12 +66,21 @@ fn main() {
             format,
             output,
             exclude,
+            rules_dir,
             parser_jar,
             java_cmd,
         } => {
-            if let Err(e) = run_scan(&path, &format, output.as_deref(), exclude.as_deref(), parser_jar.as_deref(), java_cmd.as_deref()) {
+            if let Err(e) = run_scan(
+                &path,
+                &format,
+                output.as_deref(),
+                exclude.as_deref(),
+                rules_dir.as_deref(),
+                parser_jar.as_deref(),
+                java_cmd.as_deref(),
+            ) {
                 eprintln!("Error: {e}");
-                std::process::exit(1);
+                std::process::exit(2);
             }
         }
         Command::Rules => {
@@ -73,9 +88,24 @@ fn main() {
             for r in rules::builtin_rules() {
                 println!("  {} [{}] {}", r.id(), r.severity(), r.description());
             }
+            // 也列出 YAML 规则
+            let yaml_rules = load_yaml_rules(Path::new("rules"));
+            for r in &yaml_rules {
+                println!("  {} [{}] {} (YAML)", r.id, r.severity, r.title);
+            }
         }
         Command::Version => {
             println!("java-guard {}", env!("CARGO_PKG_VERSION"));
+        }
+    }
+}
+
+fn load_yaml_rules(dir: &Path) -> Vec<rule_yaml::YamlRule> {
+    match rule_yaml::load_rule_dir(dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("warn: failed to load rules from {}: {e}", dir.display());
+            vec![]
         }
     }
 }
@@ -85,6 +115,7 @@ fn run_scan(
     format: &str,
     output: Option<&str>,
     exclude: Option<&str>,
+    rules_dir: Option<&str>,
     parser_jar: Option<&str>,
     java_cmd: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -100,14 +131,24 @@ fn run_scan(
 
     // 查找 java-parser.jar
     let jar_path = find_parser_jar(parser_jar)?;
-    let mut parser_builder = CliParser::new(&jar_path);
+    let parser_builder = CliParser::new(&jar_path);
+    let mut parser = parser_builder;
     if let Some(cmd) = java_cmd {
-        parser_builder = parser_builder.with_java_cmd(cmd);
+        parser = parser.with_java_cmd(cmd);
     }
-    let parser = parser_builder;
 
-    // 收集规则
-    let rule_list: Vec<Arc<dyn Rule<java_ast::ast::CompilationUnit>>> = rules::builtin_rules();
+    // 收集规则：内置 Rust 规则 + YAML 规则
+    let mut rule_list: Vec<Arc<dyn Rule<CompilationUnit>>> = rules::builtin_rules();
+
+    let yaml_dir = rules_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules"));
+
+    let yaml_rules = load_yaml_rules(&yaml_dir);
+    for yr in yaml_rules {
+        rule_list.push(Arc::new(YamlRuleAdapter::new(yr)));
+    }
+
     let enabled_count = rule_list.iter().filter(|r| r.enabled()).count();
 
     // 扫描文件
@@ -137,7 +178,11 @@ fn run_scan(
             .replace('\\', "/");
 
         match parser.parse(&source, &rel_path) {
-            Ok(unit) => {
+            Ok(mut unit) => {
+                // 确保 source_file 被设置（YAML 规则依赖此字段）
+                if unit.source_file.is_empty() {
+                    unit.source_file = rel_path.clone();
+                }
                 for rule in &rule_list {
                     if !rule.enabled() {
                         continue;
@@ -183,7 +228,6 @@ fn run_scan(
                     s
                 }
                 _ => {
-                    // console / sarif 默认写到文件内容
                     format!("{} violations", violations.len())
                 }
             };
@@ -217,7 +261,6 @@ fn find_parser_jar(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
     let candidates = [
         PathBuf::from("java-parser/target/java-parser.jar"),
         PathBuf::from("../java-parser/target/java-parser.jar"),
-        // CARGO_MANIFEST_DIR 在编译时已知
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("java-parser/target/java-parser.jar"),
     ];
 

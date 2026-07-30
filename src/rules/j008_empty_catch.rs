@@ -1,4 +1,4 @@
-//! 内置规则 J001：检测空 catch 块。
+//! 内置规则 J008：检测空 catch 块。
 //!
 //! 空 catch 块会吞掉异常，是常见的代码缺陷。
 
@@ -12,7 +12,7 @@ pub struct EmptyCatchRule {
 impl EmptyCatchRule {
     pub fn new() -> Self {
         Self {
-            id: RuleId("J001".to_string()),
+            id: RuleId("J008".to_string()),
         }
     }
 }
@@ -98,7 +98,7 @@ fn check_stmt(stmt: &Stmt, file: &str, out: &mut Vec<Violation>) {
             for cc in &try_stmt.catch_clauses {
                 if cc.body.statements.is_empty() {
                     out.push(Violation::new(
-                        "J001",
+                        "J008",
                         Severity::Major,
                         file,
                         cc.line,
@@ -190,7 +190,7 @@ mod tests {
         let rule = EmptyCatchRule::new();
         let vs = rule.check_unit(&unit);
         assert_eq!(vs.len(), 1);
-        assert_eq!(vs[0].rule_id.0, "J001");
+        assert_eq!(vs[0].rule_id.0, "J008");
         assert_eq!(vs[0].line, 3);
     }
 

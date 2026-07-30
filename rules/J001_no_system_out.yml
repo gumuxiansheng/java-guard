@@ -1,0 +1,10 @@
+id: J001
+title: "禁止使用 System.out.println"
+severity: minor
+category: code-smell
+pattern:
+  type: MethodCall
+  match_fields:
+    callee: "System.out"
+    method: "println"
+message: "不要使用 System.out.println，请使用日志框架（SLF4J）"
