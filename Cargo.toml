@@ -33,9 +33,11 @@ guard-core = { path = "crates/guard-core" }
 java-ast = { path = "crates/java-ast" }
 rule-yaml = { path = "crates/rule-yaml" }
 rule-rhai = { path = "crates/rule-rhai" }
+rule-plugin = { path = "crates/rule-plugin" }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 walkdir = { workspace = true }
 anyhow = "1"
 

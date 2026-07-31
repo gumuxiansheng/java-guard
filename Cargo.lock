@@ -223,6 +223,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror",
 ]
 
@@ -278,10 +279,12 @@ dependencies = [
  "clap",
  "guard-core",
  "java-ast",
+ "rule-plugin",
  "rule-rhai",
  "rule-yaml",
  "serde",
  "serde_json",
+ "serde_yaml",
  "walkdir",
 ]
 
@@ -424,7 +427,8 @@ name = "rule-plugin"
 version = "0.1.0"
 dependencies = [
  "guard-core",
- "java-ast",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

@@ -1,10 +1,13 @@
-//! guard-core — 共享核心类型与接口
+//! guard-core — JavaGuard 与 SqlGuard 共享的核心类型。
 //!
-//! 从 SqlGuard 借鉴设计，独立实现。包含 Severity、Violation、Rule trait、
-//! ViolationCollector、ReportFormat 等引擎核心类型，供 java-guard 及未来其他语言扫描器复用。
+//! 语言无关的规则引擎核心：Severity、Violation、Rule trait、Reporter、Git Diff、Gate。
 
-pub mod rule;
+pub mod gate;
+pub mod git_diff;
 pub mod reporter;
+pub mod rule;
 
-pub use rule::{Severity, Violation, RuleId, Rule, ViolationCollector, SeverityParseError};
-pub use reporter::ReportFormat;
+pub use gate::{GateConfig, GateResult, SeverityCounts};
+pub use git_diff::{DiffKind, FileDiff, GitDiffError, LineFilter, LineRange};
+pub use reporter::{report, report_to, ConsoleReporter, CsvReporter, JsonReporter, ReportFormat, SarifReporter, ScanStats};
+pub use rule::{Rule, RuleId, Severity, Violation, ViolationCollector};
