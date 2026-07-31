@@ -79,9 +79,22 @@ impl RhaiRuleEngine {
 
         let ast_dynamic = json_to_rhai(&json_val);
 
+        // 构建配置 map：把 rule.params 中的值注入为 config
+        let config_map = if rule.params.is_null() {
+            rhai::Dynamic::UNIT
+        } else {
+            // serde_yaml::Value → serde_json::Value → rhai Dynamic
+            let json_str = serde_json::to_string(&rule.params)
+                .unwrap_or_else(|_| "null".to_string());
+            let json_val: serde_json::Value = serde_json::from_str(&json_str)
+                .unwrap_or(serde_json::Value::Null);
+            json_to_rhai(&json_val)
+        };
+
         // 执行
         let mut scope = Scope::new();
         scope.push("ast", ast_dynamic);
+        scope.push("config", config_map);
 
         let result: Dynamic = self
             .engine
@@ -100,9 +113,32 @@ impl RhaiRule {
     }
 
     pub fn severity(&self) -> Severity {
-        self.severity
-            .parse()
-            .unwrap_or(Severity::Minor)
+        match self.severity.parse::<Severity>() {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "warn: rule {} has invalid severity `{}`, falling back to minor",
+                    self.id, self.severity
+                );
+                Severity::Minor
+            }
+        }
+    }
+
+    /// 加载期校验：severity 合法、script 非空。
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.severity.parse::<Severity>().is_err() {
+            errors.push(format!("invalid severity `{}`", self.severity));
+        }
+        if self.script.trim().is_empty() {
+            errors.push("empty script".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -161,7 +197,7 @@ fn parse_violations(
             .and_then(|v| v.as_int().ok())
             .unwrap_or(0) as usize;
 
-        let _end_line = map
+        let end_line = map
             .get("end_line")
             .and_then(|v| v.as_int().ok())
             .map(|v| v as usize);
@@ -172,7 +208,9 @@ fn parse_violations(
             .map(|s| s.as_str().to_string())
             .unwrap_or_else(|| "violation".to_string());
 
-        violations.push(Violation::new(rule_id, severity, file, line, &message));
+        let mut violation = Violation::new(rule_id, severity, file, line, &message);
+        violation.end_line = end_line;
+        violations.push(violation);
     }
 
     Ok(violations)
@@ -227,6 +265,7 @@ mod tests {
             severity: "minor".to_string(),
             category: "code-smell".to_string(),
             enabled: true,
+            params: serde_yaml::Value::Null,
             script: r#"
                 let violations = [];
                 let types = ast.types;
@@ -263,6 +302,7 @@ mod tests {
             severity: "minor".to_string(),
             category: "test".to_string(),
             enabled: true,
+            params: serde_yaml::Value::Null,
             script: r#"
                 let violations = [];
                 let types = ast.types;
@@ -298,6 +338,7 @@ mod tests {
             severity: "minor".to_string(),
             category: "test".to_string(),
             enabled: true,
+            params: serde_yaml::Value::Null,
             script: "let x = ;".to_string(),
         };
 

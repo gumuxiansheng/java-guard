@@ -1,5 +1,18 @@
 # JavaGuard 技术方案
 
+> ⚠️ **本文档描述目标架构（设计意图），与当前代码存在以下偏差，阅读时请注意：**
+>
+> | 设计描述 | 当前实现 | 状态 |
+> |---------|---------|------|
+> | `DaemonParser`（常驻 JVM，管道通信） | 仅实现 `CliParser`（每文件启动一个 JVM 进程 + 临时文件） | ❌ 未实现 |
+> | AST 解析缓存（内容 hash） | 无 | ❌ 未实现 |
+> | 并行解析（多个 DaemonParser 实例） | 文件级并行解析已通过 `std::thread::scope` 实现（受 CPU 核数限制） | 🟡 部分实现 |
+> | YAML `any_of` / `name_regex` / `args_count` Pattern 字段 | 实际为 `match_fields` 映射（glob/正则/列表），见 RULE_AUTHORING.md | 🟡 API 不同 |
+> | Rhai `check(node, ctx)` + `NodeWrapper` + `RuleContext` | 实际为脚本注入全局 `ast`（JSON map）并返回 ` violations` 数组 | 🟡 API 不同 |
+> | `CatchBlock` Pattern + J002 方法过长 | J008 空 catch 为 Rust 内置规则；方法过长为 J006（Rhai） | 🟡 规则 ID/类型不同 |
+>
+> **规则编写请以 [RULE_AUTHORING.md](RULE_AUTHORING.md) 为准**（描述真实 API）。
+
 ## 1. 总体架构
 
 ```

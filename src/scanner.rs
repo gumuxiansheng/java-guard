@@ -9,8 +9,6 @@ pub struct ScanResult {
     pub files: Vec<PathBuf>,
     /// 扫描根目录的规范路径。
     pub root: PathBuf,
-    /// 跳过的文件数（非 .java 或不可读）。
-    pub skipped: usize,
 }
 
 /// 递归扫描目录下的 .java 文件。
@@ -19,7 +17,8 @@ pub struct ScanResult {
 /// - `exclude`：排除的目录名（如 `target`、`node_modules`）
 pub fn scan_java_files(root: &Path, exclude: &[&str]) -> ScanResult {
     let mut files = Vec::new();
-    let mut skipped = 0;
+
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     let exclude_set: std::collections::HashSet<String> =
         exclude.iter().map(|s| s.to_string()).collect();
@@ -35,18 +34,13 @@ pub fn scan_java_files(root: &Path, exclude: &[&str]) -> ScanResult {
     }) {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => {
-                skipped += 1;
-                continue;
-            }
+            Err(_) => continue,
         };
 
         if entry.file_type().is_file() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("java") {
                 files.push(path.to_path_buf());
-            } else {
-                skipped += 1;
             }
         }
     }
@@ -55,8 +49,7 @@ pub fn scan_java_files(root: &Path, exclude: &[&str]) -> ScanResult {
 
     ScanResult {
         files,
-        root: root.to_path_buf(),
-        skipped,
+        root: canonical_root,
     }
 }
 

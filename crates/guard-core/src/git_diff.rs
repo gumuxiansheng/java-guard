@@ -100,22 +100,35 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
                 files.push(f);
             }
             // 不解析路径，等 +++ 行
+        } else if line.starts_with("--- ") {
+            // 旧文件路径：如果还没有 current_file，先创建（Modified 默认）
+            if current_file.is_none() {
+                let old_path = parse_diff_path(line);
+                current_file = Some(FileDiff {
+                    path: old_path,
+                    kind: DiffKind::Modified,
+                    line_ranges: Vec::new(),
+                    is_new: false,
+                });
+            }
         } else if line.starts_with("+++ ") {
             // 新文件路径
-            if let Some(f) = current_file.as_mut() {
-                // already set by --- line
-                continue;
+            let new_path = parse_diff_path(line);
+            match current_file.as_mut() {
+                Some(f) => {
+                    // 已通过 --- 行创建，更新路径为新路径
+                    f.path = new_path;
+                }
+                None => {
+                    // 没有 --- 行（纯新增文件）
+                    current_file = Some(FileDiff {
+                        path: new_path,
+                        kind: DiffKind::Added,
+                        line_ranges: Vec::new(),
+                        is_new: true,
+                    });
+                }
             }
-            let path = parse_diff_path(line);
-            current_file = Some(FileDiff {
-                path,
-                kind: DiffKind::Added,
-                line_ranges: Vec::new(),
-                is_new: true,
-            });
-        } else if line.starts_with("--- ") {
-            // 旧文件路径（用于判断 Modified vs Renamed）
-            // 在 --- 后面会有 +++ 行
         } else if line.starts_with("@@ ") {
             // hunk header: @@ -old_start,old_len +new_start,new_len @@
             if let Some(f) = current_file.as_mut() {
@@ -127,6 +140,14 @@ fn parse_diff(text: &str) -> Vec<FileDiff> {
             if let Some(f) = current_file.as_mut() {
                 f.is_new = true;
                 f.kind = DiffKind::Added;
+            } else {
+                // new file mode 在 --- 之前出现，先创建占位
+                current_file = Some(FileDiff {
+                    path: String::new(),
+                    kind: DiffKind::Added,
+                    line_ranges: Vec::new(),
+                    is_new: true,
+                });
             }
         } else if line.starts_with("deleted file mode") {
             // 已被 --diff-filter=d 排除，但以防万一
@@ -230,15 +251,20 @@ impl LineFilter {
 
     /// 判断某文件的某行是否在变更范围内。
     pub fn allows(&self, file: &str, line: usize) -> bool {
+        self.allows_range(file, line, None)
+    }
+
+    /// 检查某文件中 [line, end_line] 范围是否在 diff 范围内。
+    /// 如果 end_line 为 None，退化为单行检查。
+    pub fn allows_range(&self, file: &str, line: usize, end_line: Option<usize>) -> bool {
         match self.ranges.get(file) {
             None => true, // 不在 diff 列表中的文件，全量扫描
             Some(ranges) => {
-                // 在 diff 列表中的文件，只允许变更行
                 if ranges.is_empty() {
-                    // 新增文件（无 hunk 行范围），全量扫描
                     return true;
                 }
-                ranges.iter().any(|r| r.contains(line))
+                let end = end_line.unwrap_or(line);
+                ranges.iter().any(|r| r.contains(line) || r.contains(end) || (line <= r.start && end >= r.end))
             }
         }
     }
@@ -296,6 +322,7 @@ index 1234567..abcdef0 100644
         let files = parse_diff(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "src/Bar.java");
+        assert!(!files[0].is_new);
         assert_eq!(files[0].line_ranges.len(), 2);
         assert_eq!(files[0].line_ranges[0].start, 10);
         assert_eq!(files[0].line_ranges[0].end, 17);

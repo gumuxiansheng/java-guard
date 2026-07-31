@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ast::CompilationUnit;
 use crate::error::ParseError;
@@ -18,6 +19,8 @@ pub trait JavaParser {
 pub struct CliParser {
     jar_path: PathBuf,
     java_cmd: String,
+    /// 调用序号：用于生成唯一的临时文件名，避免并行解析时冲突。
+    call_seq: AtomicU64,
 }
 
 impl CliParser {
@@ -25,6 +28,7 @@ impl CliParser {
         CliParser {
             jar_path: jar_path.as_ref().to_path_buf(),
             java_cmd: std::env::var("JAVA_CMD").unwrap_or_else(|_| "java".to_string()),
+            call_seq: AtomicU64::new(0),
         }
     }
 
@@ -36,11 +40,13 @@ impl CliParser {
 
 impl JavaParser for CliParser {
     fn parse(&self, source: &str, filename: &str) -> Result<CompilationUnit, ParseError> {
-        // 写源码到临时文件
+        // 写源码到临时文件（进程 id + 调用序号保证唯一，支持并行解析）
+        let seq = self.call_seq.fetch_add(1, Ordering::Relaxed);
         let tmp_dir = std::env::temp_dir();
         let tmp_file = tmp_dir.join(format!(
-            "javaguard_parse_{}.java",
-            std::process::id()
+            "javaguard_parse_{}_{}.java",
+            std::process::id(),
+            seq
         ));
 
         std::fs::write(&tmp_file, source)?;

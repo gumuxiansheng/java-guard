@@ -20,6 +20,9 @@ pub struct RhaiRule {
     /// 是否默认启用
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 规则参数（注入到脚本的 config 变量）
+    #[serde(default)]
+    pub params: serde_yaml::Value,
 }
 
 fn default_true() -> bool {
@@ -61,13 +64,13 @@ category: code-smell
 script: |
   let unit = ast;
   let violations = [];
-  for type in unit.types {
-    for member in type.members {
-      if member.kind == "MethodDeclaration" {
-        let lines = member.end_line - member.line;
+  for type in unit["types"] {
+    for member in type["members"] {
+      if member["kind"] == "MethodDeclaration" {
+        let lines = member["end_line"] - member["line"];
         if lines > 50 {
           violations.push({
-            line: member.line,
+            line: member["line"],
             message: "方法长度 " + lines + " 行，超过 50 行限制"
           });
         }

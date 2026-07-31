@@ -1,3 +1,8 @@
 /target
 /java-parser/target
 **/*.class
+
+# 构建/测试产生的临时日志（不应进版本库）
+/test_*.txt
+/test_rhai*.txt
+

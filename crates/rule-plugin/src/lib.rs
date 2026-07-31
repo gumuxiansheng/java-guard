@@ -117,6 +117,7 @@ impl PluginLoader {
 
 /// JSON-RPC 请求（Rust → Java）。
 #[derive(Debug, Serialize)]
+#[allow(dead_code)] // 预留接口，尚未启用
 struct RpcRequest {
     action: String,
     rule_id: String,
@@ -126,6 +127,7 @@ struct RpcRequest {
 
 /// JSON-RPC 响应（Java → Rust）。
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // 预留接口，尚未启用
 struct RpcResponse {
     status: String,
     violations: Vec<RpcViolation>,
@@ -133,6 +135,7 @@ struct RpcResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // 预留接口，尚未启用
 struct RpcViolation {
     line: usize,
     end_line: Option<usize>,
@@ -142,6 +145,7 @@ struct RpcViolation {
 /// 通过 JSON-RPC 调用 Java 插件。
 ///
 /// 这是一个内测函数，MVP 阶段不暴露。
+#[allow(dead_code)] // 预留接口，尚未启用
 fn call_plugin(
     config: &PluginConfig,
     rule_id: &str,
@@ -188,7 +192,8 @@ fn call_plugin(
         ));
     }
 
-    let severity = Severity::Minor; // 从规则元数据获取
+    // TODO(MVP): severity 应从规则元数据获取，当前预留阶段硬编码为 Minor
+    let severity = Severity::Minor;
     Ok(response
         .violations
         .into_iter()

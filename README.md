@@ -34,4 +34,9 @@ java-guard (Rust CLI)
 
 ## 状态
 
-🚧 设计阶段，尚未实现。详见 [技术方案](docs/TECHNICAL_DESIGN.md)。
+✅ MVP 已实现（M1–M8 完成）：CLI 扫描、YAML / Rhai 规则引擎、增量扫描（git diff + baseline）、JSON / SARIF / CSV / 控制台报告、CI gate、Java 插件接口（预留）。
+
+> ⚠️ 已知架构缺口（尚未实现，详见 [技术方案](docs/TECHNICAL_DESIGN.md) 顶部说明）：
+> - `DaemonParser`（常驻 JVM）当前为 `CliParser`（每文件启动一个 JVM 进程），与「增量扫描 < 200ms / 全量 10w 行 < 10s」的性能目标有差距。
+> - AST 解析缓存尚未实现。
+> - 文件级解析已并行化（受 CPU 核数限制），但规则执行仍为单文件内串行。

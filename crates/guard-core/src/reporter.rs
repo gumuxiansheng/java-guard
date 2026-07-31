@@ -108,10 +108,16 @@ pub struct ConsoleReporter;
 
 impl ConsoleReporter {
     pub fn report(violations: &[Violation]) -> io::Result<()> {
-        Self::report_to(&mut io::stdout(), violations)
+        Self::report_to(&mut io::stdout(), violations, 0, 0, None)
     }
 
-    pub fn report_to<W: IoWrite>(w: &mut W, violations: &[Violation]) -> io::Result<()> {
+    pub fn report_to<W: IoWrite>(
+        w: &mut W,
+        violations: &[Violation],
+        _files_scanned: usize,
+        _parse_errors: usize,
+        _duration_ms: Option<u64>,
+    ) -> io::Result<()> {
         if violations.is_empty() {
             writeln!(w, "{}No issues found.{}", color::GREEN, color::RESET)?;
             return Ok(());
@@ -231,13 +237,75 @@ impl JsonReporter {
     }
 }
 
+/// 生成当前 UTC 时间的 RFC3339 字符串，例如 `2024-01-02T03:04:05Z`。
+///
+/// 旧实现把 Unix 秒直接当作「当天秒数」，产出 `1970-01-01T00:00:1753987200Z`
+/// 这种非法 ISO8601，导致所有 JSON/SARIF 报告的 timestamp 字段都是垃圾值。
+/// 这里基于 Howard Hinnant 的公历换算算法，无需引入外部依赖即可输出合法时间。
 fn chrono_now() -> String {
-    // 简单 UTC 时间戳，避免引入 chrono 依赖
-    let secs = std::time::SystemTime::now()
+    let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("1970-01-01T00:00:{secs:05}Z")
+        .unwrap_or_default();
+    format_rfc3339(d.as_secs(), d.subsec_nanos())
+}
+
+/// 将 Unix 时间（秒 + 纳秒）格式化为 UTC RFC3339（以 `Z` 结尾）。
+///
+/// 采用逐年简单推算（在合理时间范围内足够且易于验证），避免引入 chrono 依赖，
+/// 也不依赖易出错的闭式日期算法。
+fn format_rfc3339(secs: u64, nanos: u32) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    let days = (secs / SECS_PER_DAY) as i64;
+    let mut rem = (secs % SECS_PER_DAY) as i64;
+    let hour = rem / 3600;
+    rem %= 3600;
+    let minute = rem / 60;
+    let second = rem % 60;
+
+    let (year, month, day) = yday_to_date(days);
+
+    if nanos == 0 {
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+    } else {
+        format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z"
+        )
+    }
+}
+
+/// days since 1970-01-01 -> (year, month, day)，逐年推算（简单且可验证）。
+fn yday_to_date(mut days: i64) -> (i64, i32, i32) {
+    let mut year = 1970;
+    loop {
+        let ydays: i64 = if is_leap_year(year) { 366 } else { 365 };
+        if days < ydays {
+            break;
+        }
+        days -= ydays;
+        year += 1;
+    }
+    let (month, day) = yday_to_month_day(year, days as u32);
+    (year, month, day)
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+fn yday_to_month_day(year: i64, yday: u32) -> (i32, i32) {
+    let month_days: [u32; 12] = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut rem = yday;
+    for (i, &md) in month_days.iter().enumerate() {
+        if rem < md {
+            return ((i + 1) as i32, (rem + 1) as i32);
+        }
+        rem -= md;
+    }
+    (12, 31)
 }
 
 // ─── SARIF Reporter ──────────────────────────────────────────────
@@ -247,10 +315,16 @@ pub struct SarifReporter;
 
 impl SarifReporter {
     pub fn report(violations: &[Violation]) -> io::Result<()> {
-        Self::report_to(&mut io::stdout(), violations)
+        Self::report_to(&mut io::stdout(), violations, 0, 0, None)
     }
 
-    pub fn report_to<W: IoWrite>(w: &mut W, violations: &[Violation]) -> io::Result<()> {
+    pub fn report_to<W: IoWrite>(
+        w: &mut W,
+        violations: &[Violation],
+        _files_scanned: usize,
+        _parse_errors: usize,
+        _duration_ms: Option<u64>,
+    ) -> io::Result<()> {
         let sarif = Self::build_sarif(violations);
         let json = serde_json::to_string_pretty(&sarif)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -275,7 +349,7 @@ impl SarifReporter {
                     "id": id,
                     "name": id,
                     "shortDescription": {
-                        "text": v.message
+                        "text": id
                     },
                     "defaultConfiguration": {
                         "level": severity_to_sarif_level(v.severity)
@@ -342,10 +416,16 @@ pub struct CsvReporter;
 
 impl CsvReporter {
     pub fn report(violations: &[Violation]) -> io::Result<()> {
-        Self::report_to(&mut io::stdout(), violations)
+        Self::report_to(&mut io::stdout(), violations, 0, 0, None)
     }
 
-    pub fn report_to<W: IoWrite>(w: &mut W, violations: &[Violation]) -> io::Result<()> {
+    pub fn report_to<W: IoWrite>(
+        w: &mut W,
+        violations: &[Violation],
+        _files_scanned: usize,
+        _parse_errors: usize,
+        _duration_ms: Option<u64>,
+    ) -> io::Result<()> {
         writeln!(w, "rule_id,severity,file,line,end_line,message")?;
         for v in violations {
             let end = v.end_line.map(|e| e.to_string()).unwrap_or_default();
@@ -386,10 +466,10 @@ pub fn report_to<W: IoWrite>(
     duration_ms: Option<u64>,
 ) -> io::Result<()> {
     match format {
-        ReportFormat::Console => ConsoleReporter::report_to(w, violations),
+        ReportFormat::Console => ConsoleReporter::report_to(w, violations, files_scanned, parse_errors, duration_ms),
         ReportFormat::Json => JsonReporter::report_to(w, violations, files_scanned, parse_errors, duration_ms),
-        ReportFormat::Sarif => SarifReporter::report_to(w, violations),
-        ReportFormat::Csv => CsvReporter::report_to(w, violations),
+        ReportFormat::Sarif => SarifReporter::report_to(w, violations, files_scanned, parse_errors, duration_ms),
+        ReportFormat::Csv => CsvReporter::report_to(w, violations, files_scanned, parse_errors, duration_ms),
     }
 }
 
@@ -410,7 +490,7 @@ mod tests {
     fn console_report_produces_output() {
         let vs = sample_violations();
         let mut buf = Vec::new();
-        ConsoleReporter::report_to(&mut buf, &vs).unwrap();
+        ConsoleReporter::report_to(&mut buf, &vs, 0, 0, None).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("Foo.java"));
         assert!(output.contains("Bar.java"));
@@ -422,7 +502,7 @@ mod tests {
     #[test]
     fn console_report_empty() {
         let mut buf = Vec::new();
-        ConsoleReporter::report_to(&mut buf, &[]).unwrap();
+        ConsoleReporter::report_to(&mut buf, &[], 0, 0, None).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("No issues"));
     }
@@ -444,7 +524,7 @@ mod tests {
     fn sarif_report_valid() {
         let vs = sample_violations();
         let mut buf = Vec::new();
-        SarifReporter::report_to(&mut buf, &vs).unwrap();
+        SarifReporter::report_to(&mut buf, &vs, 0, 0, None).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["version"], "2.1.0");
@@ -456,7 +536,7 @@ mod tests {
     fn csv_report_has_header() {
         let vs = sample_violations();
         let mut buf = Vec::new();
-        CsvReporter::report_to(&mut buf, &vs).unwrap();
+        CsvReporter::report_to(&mut buf, &vs, 0, 0, None).unwrap();
         let csv = String::from_utf8(buf).unwrap();
         assert!(csv.starts_with("rule_id,severity,file,line,end_line,message"));
         assert!(csv.contains("J001"));
@@ -490,5 +570,50 @@ mod tests {
         assert_eq!(stats.by_rule.get("J002"), Some(&1));
         assert_eq!(stats.files_scanned, 3);
         assert_eq!(stats.parse_errors, 1);
+    }
+
+    #[test]
+    fn rfc3339_epoch_is_valid() {
+        assert_eq!(format_rfc3339(0, 0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_with_nanos() {
+        assert_eq!(
+            format_rfc3339(0, 500_000_000),
+            "1970-01-01T00:00:00.500000000Z"
+        );
+    }
+
+    #[test]
+    fn rfc3339_known_timestamp() {
+        // 2024-01-02T03:04:05Z == 1_704_164_645 秒（UTC）
+        assert_eq!(format_rfc3339(1_704_164_645, 0), "2024-01-02T03:04:05Z");
+    }
+
+    #[test]
+    fn yday_to_date_epoch() {
+        assert_eq!(yday_to_date(0), (1970, 1, 1));
+        assert_eq!(yday_to_date(1), (1970, 1, 2));
+        assert_eq!(yday_to_date(31), (1970, 2, 1));
+        assert_eq!(yday_to_date(365), (1971, 1, 1));
+        assert_eq!(yday_to_date(7_258), (1989, 11, 15));
+        assert_eq!(yday_to_date(19_723), (2024, 1, 1));
+    }
+
+    #[test]
+    fn json_timestamp_is_valid_rfc3339() {
+        let vs = sample_violations();
+        let mut buf = Vec::new();
+        JsonReporter::report_to(&mut buf, &vs, 3, 0, Some(100)).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let ts = parsed["scan_info"]["timestamp"].as_str().unwrap();
+        // 合法 RFC3339：以 Z 结尾，且不是旧的非法格式
+        assert!(ts.ends_with('Z'), "timestamp {ts} 应以 Z 结尾");
+        assert!(
+            !ts.starts_with("1970-01-01T00:00:"),
+            "timestamp {ts} 不应是旧的非法格式"
+        );
     }
 }

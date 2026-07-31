@@ -51,7 +51,19 @@ pub fn load_rule_dir(dir: &Path) -> Result<Vec<YamlRule>, LoadError> {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext == "yml" || ext == "yaml" {
                 match load_rule_file(&path) {
-                    Ok(r) => rules.push(r),
+                    Ok(r) => {
+                        // 校验 match_fields 键是否合法，未知键会被 matcher 静默忽略，
+                        // 导致规则「隐形失效」，故在加载期直接跳过并告警。
+                        match r.validate() {
+                            Ok(()) => rules.push(r),
+                            Err(bad) => eprintln!(
+                                "warn: skip rule {} ({}): unknown match_fields keys: {:?}",
+                                r.id,
+                                path.display(),
+                                bad
+                            ),
+                        }
+                    }
                     Err(e) => eprintln!("warn: skip rule file {path}: {e}", path = path.display()),
                 }
             }

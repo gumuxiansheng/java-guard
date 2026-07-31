@@ -9,4 +9,4 @@ pub mod rule;
 
 pub use adapter::YamlRuleAdapter;
 pub use loader::{load_rule_dir, load_rule_file, load_rule_str};
-pub use rule::{Pattern, PatternKind, YamlRule};
+pub use rule::{MatchValue, Pattern, PatternKind, YamlRule};

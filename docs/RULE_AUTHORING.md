@@ -1,14 +1,30 @@
 # JavaGuard 规则编写指南
 
+> 本文件描述 **当前真实实现** 的规则 API。设计文档（TECHNICAL_DESIGN.md）描述目标架构，
+> 二者在 Rhai/YAML 细节上已有差异，请以本文件为准。
+
 ## 规则类型
 
-JavaGuard 支持三种规则类型，按复杂度递增：
+JavaGuard 支持三种规则来源，按复杂度递增：
 
 | 类型 | 适用场景 | 编写速度 | 执行性能 |
 |------|---------|---------|---------|
-| YAML 声明式 | pattern matching（90% 规则） | 秒级 | 最快 |
-| Rhai 脚本 | 需要 AST 遍历逻辑 | 分钟级 | 快 |
-| Java 插件 | 需要数据流分析 | 小时级 | 较慢（预留） |
+| YAML 声明式 | pattern matching（绝大多数规则） | 秒级 | 最快 |
+| Rhai 脚本 | 需要自定义 AST 遍历逻辑 | 分钟级 | 快 |
+| Rust 内置 | 需要复杂控制流（如空 catch 检测） | 编译期 | 最快 |
+| Java 插件 | 数据流分析 | 小时级 | 较慢（预留，尚未启用） |
+
+## 内置规则清单
+
+| ID | 类型 | 说明 |
+|----|------|------|
+| J001 | YAML | 禁止 `System.out` / `System.err` 的 `print/println/printf` |
+| J003 | YAML | 禁止通配符 import（`import xxx.*`） |
+| J004 | YAML | 类名应使用 PascalCase |
+| J005 | YAML | 方法名应使用 camelCase |
+| J006 | Rhai | 方法体过长（默认 > 50 行） |
+| J007 | YAML | 常量（`static final` 字段）应使用 UPPER_SNAKE_CASE |
+| J008 | Rust 内置 | 禁止空 catch 块 |
 
 ## YAML 声明式规则
 
@@ -16,304 +32,232 @@ JavaGuard 支持三种规则类型，按复杂度递增：
 
 ```yaml
 id: J001                          # 全局唯一，字母+数字
-title: 禁止使用 System.out.println # 简短描述
+title: 禁止使用 System.out/err 打印 # 简短描述
 severity: minor                    # info | minor | major | critical
 category: code-smell               # code-smell | bug | security | convention
-tags: [logging, convention]        # 可选标签
 pattern:                           # 匹配模式（见下文）
-  ...
-message: "不要使用 {callee}.{method}，请使用日志框架（SLF4J）"  # {占位符} 从匹配节点取值
-```
-
-### Pattern 类型
-
-#### MethodCall — 方法调用匹配
-
-```yaml
-id: J001
-title: 禁止 System.out.println
-severity: minor
-pattern:
   type: MethodCall
-  callee:                          # 可选，不填则匹配任意 callee
-    any_of:
+  match_fields:
+    callee:
       - System.out
       - System.err
-  method:                          # 可选
-    any_of:
+    method:
+      - print
       - println
       - printf
-      - print
-  args_count:                      # 可选，参数数量约束
-    min: 1
-    max: 2
-message: "禁止使用 {callee}.{method}"
+message: "不要使用 {callee}.{method}，请使用日志框架（SLF4J）"
 ```
 
-#### Import — import 语句匹配
+### `match_fields` 取值语法
+
+每个 `match_fields` 是一个 `字段名 → 期望值` 的映射。期望值支持两种写法：
 
 ```yaml
+# 1) 单个值：精确匹配 / glob / 正则
+method: "println"        # 精确匹配 "println"
+method: "print*"         # glob：* 匹配任意字符序列
+name: "^[a-z]"           # 正则：以 ^ 开头或以 $ 结尾时按正则匹配
+callee: "System.*"       # glob：匹配 System.out / System.err 等
+
+# 2) 列表：任意一个命中即可（any_of 语义）
+method:
+  - print
+  - println
+  - printf
+```
+
+匹配判定顺序：列表中的每一项单独按「精确 / glob / 正则」规则判定，任意一项命中即字段匹配成功；
+所有字段都匹配成功，该 AST 节点才算命中。
+
+> ⚠️ **未知字段名会被静默忽略**（不会报错也不会命中），加载时会校验并跳过非法规则。
+> 各 `type` 允许使用的字段名见下表。
+
+### Pattern 类型与可用字段
+
+| `type` | 匹配目标 | 允许字段 |
+|--------|---------|---------|
+| `MethodCall` | 方法调用 | `callee`, `method`, `method_name` |
+| `Import` | import 语句 | `package`, `is_wildcard`, `is_static` |
+| `Annotation` | 注解使用 | `name`, `type` |
+| `ClassDeclaration` | 类/接口/枚举/注解声明 | `name`, `modifier`, `modifiers` |
+| `MethodDeclaration` | 方法声明 | `name`, `return_type`, `modifier`, `modifiers` |
+| `FieldDeclaration` | 字段声明 | `name`, `field_type`, `type`, `modifier`, `modifiers` |
+
+> 说明：
+> - `Import` 的 `is_wildcard` / `is_static` 取值为 `"true"` 或 `"false"`。
+> - `modifier` / `modifiers` 表示修饰符约束（如 `public`、`final`），命中条件为「存在任一修饰符匹配」。
+> - 方法声明 / 字段声明 / 类声明均会 **递归进入嵌套类**，因此深层嵌套类中的方法或字段也能被检出。
+
+### 各类型示例
+
+```yaml
+# J003 — 禁止通配符 import
 id: J003
 title: 禁止通配符 import
 severity: minor
 pattern:
   type: Import
-  is_wildcard: true                # 匹配 import xxx.*
-  # package: "com.example.**"     # 可选，包名通配符
+  match_fields:
+    is_wildcard: "true"
 message: "禁止使用通配符 import: {package}"
-```
 
-#### ClassDeclaration — 类声明匹配
-
-```yaml
+# J004 — 类名 PascalCase（正则：小写开头即违规）
 id: J004
-title: 类名必须使用 PascalCase
+title: 类名应使用 PascalCase
 severity: minor
 pattern:
   type: ClassDeclaration
-  name_regex: "^[a-z]"            # 匹配不符合规范的名称（小写开头为违规）
-  # modifiers:                    # 可选，修饰符约束
-  #   any_of: [public, abstract]
+  match_fields:
+    name: "^[a-z]"
 message: "类名 '{name}' 应使用 PascalCase"
-```
 
-#### MethodDeclaration — 方法声明匹配
-
-```yaml
+# J005 — 方法名 camelCase（正则：大写开头即违规）
 id: J005
-title: 方法名必须使用 camelCase
+title: 方法名应使用 camelCase
 severity: minor
 pattern:
   type: MethodDeclaration
-  name_regex: "^[A-Z]"            # 大写开头为违规
+  match_fields:
+    name: "^[A-Z]"
 message: "方法名 '{name}' 应使用 camelCase"
-```
 
-#### CatchBlock — catch 块匹配
-
-```yaml
-id: J008
-title: 禁止空 catch 块
-severity: major
+# J007 — 常量 UPPER_SNAKE_CASE
+id: J007
+title: 常量应使用 UPPER_SNAKE_CASE
+severity: minor
 pattern:
-  type: CatchBlock
-  is_empty: true
-message: "空 catch 块会吞没异常，至少应记录日志"
-```
-
-### StringMatcher
-
-所有需要字符串匹配的字段支持三种格式：
-
-```yaml
-# 精确匹配
-method: println
-
-# 多值匹配
-method:
-  any_of: [println, printf, print]
-
-# 正则匹配
-name_regex: "^[A-Z].*"
+  type: FieldDeclaration
+  match_fields:
+    modifier: "final"
+    name: "[a-z]"
+message: "常量（static final 字段）'{name}' 应使用 UPPER_SNAKE_CASE"
 ```
 
 ### 消息占位符
 
-`message` 字段支持从匹配节点取值：
+`message` 中可用 `{key}` 从匹配的节点取值，运行时会被替换为实际值：
 
-| 占位符 | 含义 | 示例 |
+| 占位符 | 含义 | 适用 pattern |
 |--------|------|------|
-| `{name}` | 节点名称 | 类名、方法名 |
-| `{callee}` | 方法调用者 | `System.out` |
-| `{method}` | 方法名 | `println` |
-| `{line}` | 行号 | `42` |
-| `{package}` | 包名 | `java.util` |
-| `{file}` | 文件名 | `UserService.java` |
+| `{callee}` | 方法调用者 | `MethodCall` |
+| `{method}` | 方法名 | `MethodCall` |
+| `{name}` | 节点名称（类/方法/字段/注解名） | 全部 |
+| `{return_type}` | 方法返回类型 | `MethodDeclaration` |
+| `{field_type}` | 字段类型 | `FieldDeclaration` |
+| `{package}` | 包名 | `Import` |
+| `{line}` | 命中行号 | 全部 |
+
+未提供的占位符会原样保留在消息中（不会报错）。
 
 ## Rhai 脚本规则
 
-### 基本结构
+### 脚本约定
 
-```rhai
-// rule_custom.rhai
-
-fn check(node, ctx) {
-    // node: AST 节点（CompilationUnit 级别）
-    // ctx: RuleContext，用于上报违规和读取配置
-
-    // 遍历所有方法
-    for type_decl in node.children() {
-        if type_decl.kind() == "ClassDeclaration" {
-            for member in type_decl.children() {
-                if member.kind() == "MethodDeclaration" {
-                    check_method(member, ctx);
-                }
-            }
-        }
-    }
-}
-
-fn check_method(method, ctx) {
-    let max_lines = ctx.config("max_lines", 80);
-    let body = method.get("body");
-    if body == () { return; }  // 抽象方法无 body
-
-    let lines = body.end_line() - body.line();
-    if lines > max_lines {
-        ctx.report(
-            method.name(),
-            "方法超过 " + max_lines + " 行（实际 " + lines + " 行）",
-            "major"
-        );
-    }
-}
-```
-
-### Node API
-
-每个 AST 节点提供以下方法：
-
-| 方法 | 返回类型 | 说明 |
-|------|---------|------|
-| `kind()` | `String` | 节点类型（见下表） |
-| `name()` | `String` | 节点名称（类名/方法名/变量名） |
-| `line()` | `int` | 起始行号 |
-| `end_line()` | `int` | 结束行号 |
-| `children()` | `Array<Node>` | 子节点列表 |
-| `parent()` | `Option<Node>` | 父节点 |
-| `text()` | `String` | 原始源码文本 |
-| `get(key)` | `Dynamic` | 动态属性（modifiers, return_type, body 等） |
-
-### 节点 kind 值
-
-```
-CompilationUnit
-ClassDeclaration
-InterfaceDeclaration
-EnumDeclaration
-AnnotationDeclaration
-FieldDeclaration
-MethodDeclaration
-ConstructorDeclaration
-InitializerDeclaration
-BlockStmt
-IfStmt
-ForStmt
-WhileStmt
-TryStmt
-ReturnStmt
-ThrowStmt
-ExpressionStmt
-VariableDeclarationStmt
-MethodCallExpr
-FieldAccessExpr
-NameExpr
-LiteralExpr
-BinaryExpr
-AnnotationExpr
-```
-
-### RuleContext API
-
-| 方法 | 说明 |
-|------|------|
-| `report(location, message, severity)` | 上报违规 |
-| `config(key, default)` | 读取规则参数 |
-| `file_path()` | 当前文件路径 |
-
-### 完整示例：检测缺失 @Override
-
-```rhai
-// J006-missing-override.rhai
-
-fn check(node, ctx) {
-    for type_decl in node.children() {
-        if type_decl.kind() == "ClassDeclaration" {
-            let super_name = type_decl.get("extends");
-            if super_name == () { continue; }
-
-            // 收集父类方法名（简化版：通过 implements/extends 接口名推断）
-            // 实际实现需要符号解析，这里只检查命名约定
-            for member in type_decl.children() {
-                if member.kind() == "MethodDeclaration" {
-                    let has_override = false;
-                    for ann in member.get("annotations") {
-                        if ann.name() == "Override" {
-                            has_override = true;
-                        }
-                    }
-                    // 如果方法是 public 且不以 get/set/is 开头
-                    // 且类继承了某个父类，建议标注 @Override
-                    // （这只是一个启发式，真正的检测需要符号表）
-                }
-            }
-        }
-    }
-}
-```
-
-## 规则配置
-
-### 项目级配置 (java-guard.yml)
+- 全局变量 `ast` 被注入为 **AST 的 JSON 对象**（与 `java-parser` 输出的 JSON 结构一致）。
+- 脚本应 **返回一个数组**，每个元素是 `{ line: int, message: string, end_line?: int }` 的 map。
+- 严重级别（severity）取自规则 YAML 的 `severity` 字段，脚本无需也不能设置。
 
 ```yaml
-rules:
-  enable:
-    - J001
-    - J002
-    - custom/my_rule.rhai
-
-  disable:
-    - J099
-
-  params:
-    J002:
-      max_lines: 100    # 覆盖默认值 80
-
-include:
-  - "src/main/**/*.java"
-exclude:
-  - "src/test/**"
-  - "**/generated/**"
-```
-
-### 命令行覆盖
-
-```bash
-# 启用额外规则
-java-guard scan --enable CUSTOM001
-
-# 禁用规则
-java-guard scan --disable J002
-
-# 设置参数
-java-guard scan --param J002.max_lines=100
-```
-
-## 规则测试
-
-每条规则应附带测试用例：
-
-```
-rules/rhai/J002-method-too-long.rhai
-tests/fixtures/J002/
-  ├── should_pass.java      # 方法 30 行，不触发
-  ├── should_fail.java      # 方法 100 行，触发
-  └── expected.json         # 期望的 Violation
-```
-
-`expected.json`:
-```json
-[
-  {
-    "rule_id": "J002",
-    "line": 1,
-    "message_contains": "方法超过 80 行"
+# rules/rhai/J006_long_method.yml
+id: J006
+title: 方法不超过 50 行
+severity: minor
+category: code-smell
+script: |
+  let violations = [];
+  for t in ast.types {
+    for member in t.members {
+      if member.kind == "MethodDeclaration" {
+        let lines = member.end_line - member.line;
+        if lines > 50 {
+          violations.push(#{
+            line: member.line,
+            message: "方法长度 " + lines + " 行，超过 50 行限制"
+          });
+        }
+      }
+    }
   }
-]
+  violations
 ```
 
-运行测试：
+对应的 Rust 侧加载（节选自 `rule-rhai/src/engine.rs`）：
+
+```rust
+// engine.run(rule, unit, file):
+//   1. 将 unit.raw_json（或回退 JSON）转换为 Rhai Dynamic
+//   2. 注入全局变量 ast
+//   3. 执行脚本，要求返回数组
+//   4. 逐元素解析为 Violation（line / message / end_line）
+```
+
+### AST JSON 结构（节选）
+
+```json
+{
+  "package": "com.example",
+  "imports": [ { "package": "java.util", "isWildcard": false, "isStatic": false, "line": 3 } ],
+  "types": [
+    {
+      "kind": "ClassDeclaration",
+      "name": "UserService",
+      "modifiers": ["public"],
+      "members": [
+        {
+          "kind": "MethodDeclaration",
+          "name": "findById",
+          "modifiers": ["public"],
+          "returnType": "User",
+          "line": 7,
+          "endLine": 12
+        }
+      ],
+      "line": 6,
+      "endLine": 50
+    }
+  ],
+  "sourceFile": "UserService.java"
+}
+```
+
+> 编写 Rhai 规则时，直接按上面的 JSON 字段访问即可（如 `member.kind`、`member.end_line`）。
+
+## 规则加载与校验
+
+- 规则目录默认是 `rules/`，YAML 规则放根目录，Rhai 规则放 `rules/rhai/`。
+- 加载时会校验：
+  - `match_fields` 的字段名是否合法（见上表），未知字段会 **跳过该规则并打印警告**；
+  - `severity` 是否合法（非法则告警并降级为 `minor`）；
+  - Rhai 脚本是否为空。
+
+## 命令行覆盖
+
 ```bash
-java-guard test rules/rhai/J002-method-too-long.rhai
+# 列出所有可用规则
+java-guard rules
+
+# 仅使用某批规则
+java-guard scan . --enable J001,J003
+
+# 禁用某条规则
+java-guard scan . --disable J008
+
+# 仅报告不低于某严重级别的违规
+java-guard scan . --min-severity major
+
+# 输出 JSON 报告到文件
+java-guard scan . -f json -o report.json
+```
+
+## 增量扫描与 CI Gate
+
+```bash
+# 只检查最近一次提交变更的文件与行
+java-guard scan . --diff HEAD~1
+
+# 只报告相对 baseline 的新增违规
+java-guard scan . --baseline baseline.json
+
+# CI gate：违规超阈值时退出码为 1
+java-guard scan . --gate --gate-config gate.yml
 ```

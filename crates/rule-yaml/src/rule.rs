@@ -31,15 +31,45 @@ fn default_true() -> bool {
     true
 }
 
+/// match_fields 中某个字段的期望值。
+///
+/// - `Single`：单个匹配值（精确 / glob `*` / 正则）
+/// - `Any`：多个取值的「或」列表，任意一个命中即匹配（`any_of` 语义）
+///
+/// 这样 J001 之类的规则可以写成：
+/// ```yaml
+/// match_fields:
+///   callee: [System.out, System.err]
+///   method: [print, println, printf]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum MatchValue {
+    /// 单个匹配值
+    Single(String),
+    /// 多个取值的「或」列表
+    Any(Vec<String>),
+}
+
+impl MatchValue {
+    /// 取用于布尔型字段（如 `is_wildcard`）的字符串值；列表取第一个。
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            MatchValue::Single(s) => Some(s.as_str()),
+            MatchValue::Any(list) => list.first().map(|s| s.as_str()),
+        }
+    }
+}
+
 /// 匹配模式：描述要匹配的 AST 节点类型和条件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pattern {
     /// pattern 类型
     #[serde(rename = "type")]
     pub kind: PatternKind,
-    /// 限定条件（字段名 → 期望值），支持通配符 `*`
+    /// 限定条件（字段名 → 期望值），支持通配符 `*` 与 any_of 列表
     #[serde(default)]
-    pub match_fields: std::collections::BTreeMap<String, String>,
+    pub match_fields: std::collections::BTreeMap<String, MatchValue>,
 }
 
 /// 支持的 pattern 类型。
@@ -70,6 +100,47 @@ impl YamlRule {
             .parse()
             .unwrap_or(Severity::Minor)
     }
+
+    /// 校验规则定义，返回错误列表（非法的 match_fields 键 + 非法 severity）。
+    ///
+    /// matcher 对未知键会静默忽略（既不命中也不报错），导致规则「隐形失效」：
+    /// 作者以为规则生效，实际从未匹配。severity 解析失败会静默降级为 Minor。
+    /// 此处在加载期尽早暴露这两类配置错误。
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        let allowed = allowed_match_fields(self.pattern.kind.clone());
+        for key in self.pattern.match_fields.keys() {
+            if !allowed.contains(&key.as_str()) {
+                errors.push(format!(
+                    "unknown match_fields key `{key}` (allowed for {:?}: {:?})",
+                    self.pattern.kind, allowed
+                ));
+            }
+        }
+        if self.severity.parse::<Severity>().is_err() {
+            errors.push(format!("invalid severity `{}`", self.severity));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// 各 Pattern 类型允许使用的 match_fields 键。
+///
+/// 与 `matcher.rs` 中的取值逻辑保持一致；未知键会被 matcher 静默忽略，
+/// 故通过 [`YamlRule::validate`] 在加载期提前暴露。
+fn allowed_match_fields(kind: PatternKind) -> &'static [&'static str] {
+    match kind {
+        PatternKind::MethodCall => &["callee", "method", "method_name"],
+        PatternKind::Import => &["package", "is_wildcard", "is_static"],
+        PatternKind::Annotation => &["name", "type"],
+        PatternKind::ClassDeclaration => &["name", "modifier", "modifiers"],
+        PatternKind::MethodDeclaration => &["name", "return_type", "modifier", "modifiers"],
+        PatternKind::FieldDeclaration => &["name", "field_type", "type", "modifier", "modifiers"],
+    }
 }
 
 #[cfg(test)]
@@ -93,8 +164,14 @@ message: "不要使用 System.out.println，请使用日志框架（SLF4J）"
         let rule: YamlRule = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rule.id, "J001");
         assert_eq!(rule.pattern.kind, PatternKind::MethodCall);
-        assert_eq!(rule.pattern.match_fields.get("callee").unwrap(), "System.out");
-        assert_eq!(rule.pattern.match_fields.get("method").unwrap(), "println");
+        assert_eq!(
+            rule.pattern.match_fields.get("callee").unwrap(),
+            &MatchValue::Single("System.out".to_string())
+        );
+        assert_eq!(
+            rule.pattern.match_fields.get("method").unwrap(),
+            &MatchValue::Single("println".to_string())
+        );
     }
 
     #[test]

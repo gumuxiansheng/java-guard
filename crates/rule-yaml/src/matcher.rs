@@ -1,15 +1,17 @@
 //! Pattern 匹配器：遍历 AST，根据 Pattern 定义收集违规。
 
-use crate::rule::{Pattern, PatternKind};
+use crate::rule::{MatchValue, Pattern, PatternKind};
 use guard_core::rule::Violation;
 use java_ast::ast::{
     Annotation, CompilationUnit, Expr, MemberDecl, MethodDecl, TypeDecl,
 };
 use regex::Regex;
+use std::collections::BTreeMap;
 
 /// 在编译单元中执行 pattern 匹配，返回违规列表。
 ///
 /// `file` 是当前文件路径（用于 Violation），`rule_id` / `severity` / `message` 来自规则。
+/// `message` 中的 `{callee}` / `{name}` / `{line}` 等占位符会被替换为实际匹配值。
 pub fn match_pattern(
     pattern: &Pattern,
     unit: &CompilationUnit,
@@ -28,8 +30,10 @@ pub fn match_pattern(
         }
         PatternKind::Import => {
             for imp in &unit.imports {
-                if match_fields_import(imp, &pattern.match_fields) {
-                    violations.push(Violation::new(rule_id, severity, file, imp.line, message));
+                if let Some(mut ctx) = match_fields_import(imp, &pattern.match_fields) {
+                    ctx.push(("line", imp.line.to_string()));
+                    let msg = render_message(message, &ctx);
+                    violations.push(Violation::new(rule_id, severity, file, imp.line, msg));
                 }
             }
         }
@@ -41,8 +45,10 @@ pub fn match_pattern(
         PatternKind::ClassDeclaration => {
             for ty in &unit.types {
                 if let TypeDecl::ClassDeclaration(cd) = ty {
-                    if match_fields_class(cd, &pattern.match_fields) {
-                        violations.push(Violation::new(rule_id, severity, file, cd.line, message));
+                    if let Some(mut ctx) = match_fields_class(cd, &pattern.match_fields) {
+                        ctx.push(("line", cd.line.to_string()));
+                        let msg = render_message(message, &ctx);
+                        violations.push(Violation::new(rule_id, severity, file, cd.line, msg));
                     }
                     // 递归检查嵌套类
                     match_members_for_class_decl(&cd.members, pattern, file, rule_id, severity, message, &mut violations);
@@ -216,8 +222,10 @@ fn walk_expr_for_method_call(
 ) {
     match expr {
         Expr::MethodCallExpr(mc) => {
-            if match_fields_method_call(mc, &pattern.match_fields) {
-                out.push(Violation::new(rule_id, severity, file, mc.line, message));
+            if let Some(mut ctx) = match_fields_method_call(mc, &pattern.match_fields) {
+                ctx.push(("line", mc.line.to_string()));
+                let msg = render_message(message, &ctx);
+                out.push(Violation::new(rule_id, severity, file, mc.line, msg));
             }
             // 递归检查参数中的嵌套调用
             for arg in &mc.arguments {
@@ -262,47 +270,66 @@ fn walk_expr_for_method_call(
     }
 }
 
+/// 匹配 MethodCall 的字段；命中返回用于渲染 message 的上下文，否则返回 None。
 fn match_fields_method_call(
     mc: &java_ast::ast::MethodCallExpr,
-    fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
+    fields: &BTreeMap<String, MatchValue>,
+) -> Option<Vec<(&'static str, String)>> {
+    let mut ctx: Vec<(&'static str, String)> = Vec::new();
     for (key, expected) in fields {
-        let actual = match key.as_str() {
-            "callee" => mc.callee.as_deref().unwrap_or(""),
-            "method" | "method_name" => &mc.method_name,
-            _ => continue,
+        let resolved: Option<(&str, &'static str)> = match key.as_str() {
+            "callee" => Some((mc.callee.as_deref().unwrap_or(""), "callee")),
+            "method" | "method_name" => Some((&mc.method_name, "method")),
+            _ => None,
         };
-        if !glob_match(expected, actual) {
-            return false;
+        let (actual, label) = match resolved {
+            Some(r) => r,
+            // 未知键已在加载期校验拦截，这里安全跳过
+            None => continue,
+        };
+        if !value_matches(expected, actual) {
+            return None;
         }
+        ctx.push((label, actual.to_string()));
     }
-    true
+    Some(ctx)
 }
 
 // ── Import 匹配 ──
 
+/// 匹配 Import 的字段；命中返回上下文，否则 None。
 fn match_fields_import(
     imp: &java_ast::ast::ImportDecl,
-    fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
+    fields: &BTreeMap<String, MatchValue>,
+) -> Option<Vec<(&'static str, String)>> {
+    let mut ctx: Vec<(&'static str, String)> = Vec::new();
     for (key, expected) in fields {
         let matched = match key.as_str() {
-            "package" => glob_match(expected, &imp.package),
+            "package" => value_matches(expected, &imp.package),
             "is_wildcard" => {
-                let want = expected.eq_ignore_ascii_case("true");
+                let want = expected
+                    .as_str()
+                    .map(|s| s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
                 imp.is_wildcard == want
             }
             "is_static" => {
-                let want = expected.eq_ignore_ascii_case("true");
+                let want = expected
+                    .as_str()
+                    .map(|s| s.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
                 imp.is_static == want
             }
-            _ => true,
+            _ => continue,
         };
         if !matched {
-            return false;
+            return None;
+        }
+        if key == "package" {
+            ctx.push(("package", imp.package.clone()));
         }
     }
-    true
+    Some(ctx)
 }
 
 // ── Annotation 匹配 ──
@@ -319,16 +346,20 @@ fn match_type_for_annotation(
     // 检查类型上的注解
     let (annotations, members) = type_annotations_and_members(ty);
     for ann in annotations {
-        if match_fields_annotation(ann, &pattern.match_fields) {
-            out.push(Violation::new(rule_id, severity, file, ann.line, message));
+        if let Some(mut ctx) = match_fields_annotation(ann, &pattern.match_fields) {
+            ctx.push(("line", ann.line.to_string()));
+            let msg = render_message(message, &ctx);
+            out.push(Violation::new(rule_id, severity, file, ann.line, msg));
         }
     }
     // 递归检查成员上的注解
     for m in members {
         let member_anns = member_annotations(m);
         for ann in member_anns {
-            if match_fields_annotation(ann, &pattern.match_fields) {
-                out.push(Violation::new(rule_id, severity, file, ann.line, message));
+            if let Some(mut ctx) = match_fields_annotation(ann, &pattern.match_fields) {
+                ctx.push(("line", ann.line.to_string()));
+                let msg = render_message(message, &ctx);
+                out.push(Violation::new(rule_id, severity, file, ann.line, msg));
             }
         }
         // 递归嵌套类型
@@ -341,46 +372,53 @@ fn match_type_for_annotation(
     }
 }
 
+/// 匹配 Annotation 的字段；命中返回上下文，否则 None。
 fn match_fields_annotation(
     ann: &Annotation,
-    fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
+    fields: &BTreeMap<String, MatchValue>,
+) -> Option<Vec<(&'static str, String)>> {
+    let mut ctx: Vec<(&'static str, String)> = Vec::new();
     for (key, expected) in fields {
-        let actual = match key.as_str() {
-            "name" | "type" => &ann.name,
+        let (actual, label) = match key.as_str() {
+            "name" | "type" => (&ann.name, "name"),
             _ => continue,
         };
-        if !glob_match(expected, actual) {
-            return false;
+        if !value_matches(expected, actual) {
+            return None;
         }
+        ctx.push((label, actual.to_string()));
     }
-    true
+    Some(ctx)
 }
 
 // ── ClassDeclaration 匹配 ──
 
+/// 匹配 ClassDecl 的字段；命中返回上下文，否则 None。
 fn match_fields_class(
     cd: &java_ast::ast::ClassDecl,
-    fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
+    fields: &BTreeMap<String, MatchValue>,
+) -> Option<Vec<(&'static str, String)>> {
+    let mut ctx: Vec<(&'static str, String)> = Vec::new();
     for (key, expected) in fields {
-        let actual = match key.as_str() {
-            "name" => &cd.name,
+        let resolved: Option<(&str, &'static str)> = match key.as_str() {
+            "name" => Some((&cd.name, "name")),
             "modifier" | "modifiers" => {
-                // 修饰符匹配：期望值在修饰符列表中
-                let found = cd.modifiers.iter().any(|m| glob_match(expected, m));
+                let found = cd.modifiers.iter().any(|m| value_matches(expected, m));
+                ctx.push(("modifier", cd.modifiers.join(", ")));
                 if !found {
-                    return false;
+                    return None;
                 }
                 continue;
             }
             _ => continue,
         };
-        if !regex_match(expected, actual) {
-            return false;
+        let (actual, label) = match resolved { Some(r) => r, None => continue };
+        if !value_matches(expected, actual) {
+            return None;
         }
+        ctx.push((label, actual.to_string()));
     }
-    true
+    Some(ctx)
 }
 
 fn match_members_for_class_decl(
@@ -394,8 +432,10 @@ fn match_members_for_class_decl(
 ) {
     for m in members {
         if let MemberDecl::ClassDeclaration(cd) = m {
-            if match_fields_class(cd, &pattern.match_fields) {
-                out.push(Violation::new(rule_id, severity, file, cd.line, message));
+            if let Some(mut ctx) = match_fields_class(cd, &pattern.match_fields) {
+                ctx.push(("line", cd.line.to_string()));
+                let msg = render_message(message, &ctx);
+                out.push(Violation::new(rule_id, severity, file, cd.line, msg));
             }
             match_members_for_class_decl(&cd.members, pattern, file, rule_id, severity, message, out);
         }
@@ -403,6 +443,8 @@ fn match_members_for_class_decl(
 }
 
 // ── MethodDeclaration 匹配 ──
+//
+// 与 MethodCall 保持一致：递归进入嵌套类，确保深层嵌套类中的方法也能被检出。
 
 fn match_type_for_method_decl(
     ty: &TypeDecl,
@@ -415,51 +457,68 @@ fn match_type_for_method_decl(
 ) {
     let members = type_members(ty);
     for m in members {
-        match m {
-            MemberDecl::MethodDeclaration(md) => {
-                if match_fields_method_decl(md, &pattern.match_fields) {
-                    out.push(Violation::new(rule_id, severity, file, md.line, message));
-                }
-            }
-            MemberDecl::ClassDeclaration(cd) => {
-                for m in &cd.members {
-                    if let MemberDecl::MethodDeclaration(md) = m {
-                        if match_fields_method_decl(md, &pattern.match_fields) {
-                            out.push(Violation::new(rule_id, severity, file, md.line, message));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        match_member_for_method_decl(m, pattern, file, rule_id, severity, message, out);
     }
 }
 
+fn match_member_for_method_decl(
+    m: &MemberDecl,
+    pattern: &Pattern,
+    file: &str,
+    rule_id: &str,
+    severity: guard_core::rule::Severity,
+    message: &str,
+    out: &mut Vec<Violation>,
+) {
+    match m {
+        MemberDecl::MethodDeclaration(md) => {
+            if let Some(mut ctx) = match_fields_method_decl(md, &pattern.match_fields) {
+                ctx.push(("line", md.line.to_string()));
+                let msg = render_message(message, &ctx);
+                out.push(Violation::new(rule_id, severity, file, md.line, msg));
+            }
+        }
+        MemberDecl::ClassDeclaration(cd) => {
+            for m in &cd.members {
+                match_member_for_method_decl(m, pattern, file, rule_id, severity, message, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 匹配 MethodDecl 的字段；命中返回上下文，否则 None。
 fn match_fields_method_decl(
     md: &MethodDecl,
-    fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
+    fields: &BTreeMap<String, MatchValue>,
+) -> Option<Vec<(&'static str, String)>> {
+    let mut ctx: Vec<(&'static str, String)> = Vec::new();
     for (key, expected) in fields {
-        let actual = match key.as_str() {
-            "name" => &md.name,
-            "return_type" => md.return_type.as_deref().unwrap_or(""),
+        let resolved: Option<(&str, &'static str)> = match key.as_str() {
+            "name" => Some((&md.name, "name")),
+            "return_type" => Some((md.return_type.as_deref().unwrap_or(""), "return_type")),
             "modifier" | "modifiers" => {
-                let found = md.modifiers.iter().any(|m| glob_match(expected, m));
+                let found = md.modifiers.iter().any(|m| value_matches(expected, m));
+                ctx.push(("modifier", md.modifiers.join(", ")));
                 if !found {
-                    return false;
+                    return None;
                 }
                 continue;
             }
             _ => continue,
         };
-        if !regex_match(expected, actual) {
-            return false;
+        let (actual, label) = match resolved { Some(r) => r, None => continue };
+        if !value_matches(expected, actual) {
+            return None;
         }
+        ctx.push((label, actual.to_string()));
     }
-    true
+    Some(ctx)
 }
 
 // ── FieldDeclaration 匹配 ──
+//
+// 与 MethodDeclaration 保持一致：递归进入嵌套类。
 
 fn match_type_for_field_decl(
     ty: &TypeDecl,
@@ -472,36 +531,63 @@ fn match_type_for_field_decl(
 ) {
     let members = type_members(ty);
     for m in members {
-        if let MemberDecl::FieldDeclaration(fd) = m {
-            if match_fields_field_decl(fd, &pattern.match_fields) {
-                out.push(Violation::new(rule_id, severity, file, fd.line, message));
-            }
-        }
+        match_member_for_field_decl(m, pattern, file, rule_id, severity, message, out);
     }
 }
 
+fn match_member_for_field_decl(
+    m: &MemberDecl,
+    pattern: &Pattern,
+    file: &str,
+    rule_id: &str,
+    severity: guard_core::rule::Severity,
+    message: &str,
+    out: &mut Vec<Violation>,
+) {
+    match m {
+        MemberDecl::FieldDeclaration(fd) => {
+            if let Some(mut ctx) = match_fields_field_decl(fd, &pattern.match_fields) {
+                ctx.push(("line", fd.line.to_string()));
+                let msg = render_message(message, &ctx);
+                out.push(Violation::new(rule_id, severity, file, fd.line, msg));
+            }
+        }
+        MemberDecl::ClassDeclaration(cd) => {
+            for m in &cd.members {
+                match_member_for_field_decl(m, pattern, file, rule_id, severity, message, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 匹配 FieldDecl 的字段；命中返回上下文，否则 None。
 fn match_fields_field_decl(
     fd: &java_ast::ast::FieldDecl,
-    fields: &std::collections::BTreeMap<String, String>,
-) -> bool {
+    fields: &BTreeMap<String, MatchValue>,
+) -> Option<Vec<(&'static str, String)>> {
+    let mut ctx: Vec<(&'static str, String)> = Vec::new();
     for (key, expected) in fields {
-        let actual = match key.as_str() {
-            "name" => &fd.name,
-            "field_type" | "type" => fd.field_type.as_deref().unwrap_or(""),
+        let resolved: Option<(&str, &'static str)> = match key.as_str() {
+            "name" => Some((&fd.name, "name")),
+            "field_type" | "type" => Some((fd.field_type.as_deref().unwrap_or(""), "field_type")),
             "modifier" | "modifiers" => {
-                let found = fd.modifiers.iter().any(|m| glob_match(expected, m));
+                let found = fd.modifiers.iter().any(|m| value_matches(expected, m));
+                ctx.push(("modifier", fd.modifiers.join(", ")));
                 if !found {
-                    return false;
+                    return None;
                 }
                 continue;
             }
             _ => continue,
         };
-        if !regex_match(expected, actual) {
-            return false;
+        let (actual, label) = match resolved { Some(r) => r, None => continue };
+        if !value_matches(expected, actual) {
+            return None;
         }
+        ctx.push((label, actual.to_string()));
     }
-    true
+    Some(ctx)
 }
 
 // ── 辅助函数 ──
@@ -533,6 +619,23 @@ fn member_annotations(m: &MemberDecl) -> &[Annotation] {
     }
 }
 
+/// 判断 MatchValue 是否匹配给定文本（Single 精确/glob/正则，Any 任意一个命中）。
+fn value_matches(v: &MatchValue, text: &str) -> bool {
+    match v {
+        MatchValue::Single(s) => regex_match(s, text),
+        MatchValue::Any(list) => list.iter().any(|s| regex_match(s, text)),
+    }
+}
+
+/// 用 (key, value) 替换模板中的 `{key}` 占位符；未提供的占位符原样保留。
+fn render_message(template: &str, ctx: &[(&str, String)]) -> String {
+    let mut out = template.to_string();
+    for (k, v) in ctx {
+        out = out.replace(&format!("{{{k}}}"), v);
+    }
+    out
+}
+
 /// 通配符匹配：`*` 匹配任意字符序列。
 fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
@@ -557,8 +660,14 @@ fn regex_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    // 如果含正则元字符，用正则匹配
-    if pattern.starts_with('^') || pattern.ends_with('$') {
+    // 如果含正则元字符（^ $ [] + | ? 等），用正则匹配
+    if pattern.starts_with('^')
+        || pattern.ends_with('$')
+        || pattern.contains('[')
+        || pattern.contains('+')
+        || pattern.contains('|')
+        || pattern.contains("\\")
+    {
         if let Ok(re) = Regex::new(pattern) {
             return re.is_match(text);
         }
@@ -630,13 +739,14 @@ mod tests {
         let pattern = Pattern {
             kind: PatternKind::MethodCall,
             match_fields: [
-                ("callee".to_string(), "System.out".to_string()),
-                ("method".to_string(), "println".to_string()),
+                ("callee".to_string(), MatchValue::Single("System.out".to_string())),
+                ("method".to_string(), MatchValue::Single("println".to_string())),
             ].into_iter().collect(),
         };
-        let vs = match_pattern(&pattern, &unit, "Test.java", "J001", Severity::Minor, "test");
+        let vs = match_pattern(&pattern, &unit, "Test.java", "J001", Severity::Minor, "call {callee}.{method} at {line}");
         assert_eq!(vs.len(), 1);
         assert_eq!(vs[0].line, 5);
+        assert_eq!(vs[0].message, "call System.out.println at 5");
     }
 
     #[test]
@@ -644,7 +754,7 @@ mod tests {
         let unit = make_unit();
         let pattern = Pattern {
             kind: PatternKind::Import,
-            match_fields: [("is_wildcard".to_string(), "true".to_string())]
+            match_fields: [("is_wildcard".to_string(), MatchValue::Single("true".to_string()))]
                 .into_iter()
                 .collect(),
         };
@@ -658,11 +768,76 @@ mod tests {
         let unit = make_unit();
         let pattern = Pattern {
             kind: PatternKind::ClassDeclaration,
-            match_fields: [("name".to_string(), "^[a-z]".to_string())]
+            match_fields: [("name".to_string(), MatchValue::Single("^[a-z]".to_string()))]
                 .into_iter()
                 .collect(),
         };
         let vs = match_pattern(&pattern, &unit, "Test.java", "J004", Severity::Minor, "test");
         assert_eq!(vs.len(), 1); // "badName" 以小写开头
+    }
+
+    #[test]
+    fn match_value_any_of() {
+        let unit = make_unit();
+        // any_of：callee 为 System.out 或 System.err 都应命中
+        let pattern = Pattern {
+            kind: PatternKind::MethodCall,
+            match_fields: [
+                ("callee".to_string(), MatchValue::Any(vec!["System.out".to_string(), "System.err".to_string()])),
+                ("method".to_string(), MatchValue::Any(vec!["print".to_string(), "println".to_string(), "printf".to_string()])),
+            ].into_iter().collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "Test.java", "J001", Severity::Minor, "no sysout");
+        assert_eq!(vs.len(), 1);
+    }
+
+    #[test]
+    fn match_method_decl_nested_class() {
+        // 深层嵌套类里的方法也应被 MethodDeclaration 检出（递归一致）
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "Outer".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::ClassDeclaration(ClassDecl {
+                    name: "Inner".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    extends: None,
+                    implements: vec![],
+                    members: vec![MemberDecl::MethodDeclaration(MethodDecl {
+                        name: "BADNAME".to_string(),
+                        modifiers: vec![],
+                        annotations: vec![],
+                        return_type: None,
+                        parameters: vec![],
+                        body: None,
+                        line: 10,
+                        end_line: 10,
+                    })],
+                    line: 8,
+                    end_line: 12,
+                })],
+                line: 1,
+                end_line: 20,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::MethodDeclaration,
+            match_fields: [("name".to_string(), MatchValue::Single("^[A-Z]+$".to_string()))]
+                .into_iter()
+                .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J005", Severity::Minor, "bad method {name}");
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].line, 10);
+        assert_eq!(vs[0].message, "bad method BADNAME");
     }
 }
