@@ -29,9 +29,9 @@
     </plugins>
   </build>
   <properties>
-    <maven.compiler.target>17</maven.compiler.target>
+    <maven.compiler.target>8</maven.compiler.target>
     <javaparser.version>3.28.2</javaparser.version>
-    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.source>8</maven.compiler.source>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
 </project>

@@ -661,3 +661,117 @@ fn load_project_config(path: &str) -> anyhow::Result<ProjectConfig> {
         .map_err(|e| anyhow::anyhow!("parse config {path}: {e}"))?;
     Ok(cfg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parse_scan_defaults() {
+        let cli = Cli::parse_from(vec!["java-guard", "scan", "."]);
+        match cli.command {
+            Command::Scan { format, path, .. } => {
+                assert_eq!(path, ".");
+                assert_eq!(format, "console");
+            }
+            _ => panic!("expected Scan"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_scan_json_format_and_gate() {
+        let cli = Cli::parse_from(vec!["java-guard", "scan", "src", "-f", "json", "--gate"]);
+        match cli.command {
+            Command::Scan { format, gate, .. } => {
+                assert_eq!(format, "json");
+                assert!(gate);
+            }
+            _ => panic!("expected Scan"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_rules_and_version() {
+        assert!(matches!(
+            Cli::parse_from(vec!["java-guard", "rules"]).command,
+            Command::Rules
+        ));
+        assert!(matches!(
+            Cli::parse_from(vec!["java-guard", "version"]).command,
+            Command::Version
+        ));
+    }
+
+    #[test]
+    fn load_project_config_missing_returns_default() {
+        let cfg = load_project_config("__nonexistent_config_12345.yml").unwrap();
+        assert!(cfg.rules.enable.is_empty());
+        assert!(cfg.rules.disable.is_empty());
+        assert!(cfg.scan.include.is_empty());
+        assert!(cfg.scan.exclude.is_empty());
+        assert!(cfg.gate.is_none());
+    }
+
+    #[test]
+    fn load_project_config_parses_rules() {
+        let dir = std::env::temp_dir().join("javaguard_cfg_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("java-guard.yml");
+        let yaml = concat!(
+            "rules:\n",
+            "  enable: [J001, J003]\n",
+            "  disable: [J008]\n",
+            "  min_severity: major\n",
+            "scan:\n",
+            "  include: [src/main]\n",
+            "  exclude: [build]\n",
+        );
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = load_project_config(path.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.rules.enable, vec!["J001".to_string(), "J003".to_string()]);
+        assert_eq!(cfg.rules.disable, vec!["J008".to_string()]);
+        assert_eq!(cfg.rules.min_severity.as_deref(), Some("major"));
+        assert_eq!(cfg.scan.include, vec!["src/main".to_string()]);
+        assert_eq!(cfg.scan.exclude, vec!["build".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_parser_jar_explicit_existing() {
+        let dir = std::env::temp_dir().join("javaguard_jar_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let jar = dir.join("java-parser.jar");
+        std::fs::write(&jar, b"fake").unwrap();
+        let found = find_parser_jar(Some(jar.to_str().unwrap())).unwrap();
+        assert_eq!(found, jar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_parser_jar_explicit_missing_errors() {
+        let res = find_parser_jar(Some("/no/such/java-parser.jar"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn load_baseline_parses_known_violations() {
+        let dir = std::env::temp_dir().join("javaguard_baseline_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("baseline.json");
+        std::fs::write(&path, r#"[{"file":"A.java","line":10,"rule_id":"J001"}]"#).unwrap();
+        let set = load_baseline(path.to_str().unwrap()).unwrap();
+        assert!(set.contains(&("A.java".to_string(), 10, "J001".to_string())));
+        assert!(!set.contains(&("A.java".to_string(), 11, "J001".to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_baseline_invalid_json_errors() {
+        let dir = std::env::temp_dir().join("javaguard_baseline_test2");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_baseline(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

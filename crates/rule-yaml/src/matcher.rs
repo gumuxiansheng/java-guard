@@ -377,7 +377,8 @@ fn match_fields_annotation(
     ann: &Annotation,
     fields: &BTreeMap<String, MatchValue>,
 ) -> Option<Vec<(&'static str, String)>> {
-    let mut ctx: Vec<(&'static str, String)> = Vec::new();
+    // 预置节点固有属性，保证消息模板占位符始终可渲染。
+    let mut ctx: Vec<(&'static str, String)> = vec![("name", ann.name.clone())];
     for (key, expected) in fields {
         let (actual, label) = match key.as_str() {
             "name" | "type" => (&ann.name, "name"),
@@ -398,7 +399,11 @@ fn match_fields_class(
     cd: &java_ast::ast::ClassDecl,
     fields: &BTreeMap<String, MatchValue>,
 ) -> Option<Vec<(&'static str, String)>> {
-    let mut ctx: Vec<(&'static str, String)> = Vec::new();
+    // 预置节点固有属性，保证消息模板占位符始终可渲染。
+    let mut ctx: Vec<(&'static str, String)> = vec![
+        ("name", cd.name.clone()),
+        ("modifier", cd.modifiers.join(", ")),
+    ];
     for (key, expected) in fields {
         let resolved: Option<(&str, &'static str)> = match key.as_str() {
             "name" => Some((&cd.name, "name")),
@@ -492,7 +497,13 @@ fn match_fields_method_decl(
     md: &MethodDecl,
     fields: &BTreeMap<String, MatchValue>,
 ) -> Option<Vec<(&'static str, String)>> {
-    let mut ctx: Vec<(&'static str, String)> = Vec::new();
+    // 预置节点固有属性：即使规则没有在该字段上做匹配，
+    // 消息模板里的 `{name}` / `{return_type}` / `{modifier}` 也能正常渲染。
+    let mut ctx: Vec<(&'static str, String)> = vec![
+        ("name", md.name.clone()),
+        ("return_type", md.return_type.clone().unwrap_or_default()),
+        ("modifier", md.modifiers.join(", ")),
+    ];
     for (key, expected) in fields {
         let resolved: Option<(&str, &'static str)> = match key.as_str() {
             "name" => Some((&md.name, "name")),
@@ -566,7 +577,12 @@ fn match_fields_field_decl(
     fd: &java_ast::ast::FieldDecl,
     fields: &BTreeMap<String, MatchValue>,
 ) -> Option<Vec<(&'static str, String)>> {
-    let mut ctx: Vec<(&'static str, String)> = Vec::new();
+    // 预置节点固有属性，保证消息模板占位符始终可渲染。
+    let mut ctx: Vec<(&'static str, String)> = vec![
+        ("name", fd.name.clone()),
+        ("field_type", fd.field_type.clone().unwrap_or_default()),
+        ("modifier", fd.modifiers.join(", ")),
+    ];
     for (key, expected) in fields {
         let resolved: Option<(&str, &'static str)> = match key.as_str() {
             "name" => Some((&fd.name, "name")),
@@ -839,5 +855,403 @@ mod tests {
         assert_eq!(vs.len(), 1);
         assert_eq!(vs[0].line, 10);
         assert_eq!(vs[0].message, "bad method BADNAME");
+    }
+
+    // ── value_matches 单测（精确 / glob / 正则 / any_of）──
+
+    #[test]
+    fn value_matches_exact() {
+        assert!(value_matches(&MatchValue::Single("System.out".to_string()), "System.out"));
+        assert!(!value_matches(&MatchValue::Single("System.out".to_string()), "System.err"));
+    }
+
+    #[test]
+    fn value_matches_glob() {
+        assert!(value_matches(&MatchValue::Single("Sys*".to_string()), "System.out"));
+        assert!(value_matches(&MatchValue::Single("*out".to_string()), "System.out"));
+        assert!(!value_matches(&MatchValue::Single("Foo*".to_string()), "Bar"));
+        // 裸 "*" 匹配任意
+        assert!(value_matches(&MatchValue::Single("*".to_string()), "anything"));
+    }
+
+    #[test]
+    fn value_matches_regex() {
+        assert!(value_matches(&MatchValue::Single("^[a-z]".to_string()), "badName"));
+        assert!(!value_matches(&MatchValue::Single("^[a-z]".to_string()), "GoodName"));
+        // 含正则元字符才走正则；纯字符串走精确/通配
+        assert!(value_matches(&MatchValue::Single("^J[0-9]+$".to_string()), "J007"));
+        assert!(!value_matches(&MatchValue::Single("^J[0-9]+$".to_string()), "X007"));
+    }
+
+    #[test]
+    fn value_matches_any_of() {
+        let v = MatchValue::Any(vec!["System.out".to_string(), "System.err".to_string()]);
+        assert!(value_matches(&v, "System.err"));
+        assert!(value_matches(&v, "System.out"));
+        assert!(!value_matches(&v, "java.lang"));
+    }
+
+    // ── render_message 单测 ──
+
+    #[test]
+    fn render_message_substitutes() {
+        let ctx = vec![
+            ("callee", "System.out".to_string()),
+            ("method", "println".to_string()),
+        ];
+        assert_eq!(
+            render_message("{callee}.{method} called", &ctx),
+            "System.out.println called"
+        );
+    }
+
+    #[test]
+    fn render_message_keeps_unknown() {
+        let ctx = vec![("callee", "X".to_string())];
+        assert_eq!(
+            render_message("{callee} {unknown}", &ctx),
+            "X {unknown}"
+        );
+    }
+
+    // ── 各 PatternKind 匹配单测 ──
+
+    #[test]
+    fn match_annotation_by_name() {
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "Controller".to_string(),
+                modifiers: vec![],
+                annotations: vec![Annotation {
+                    name: "RestController".to_string(),
+                    members: vec![],
+                    line: 1,
+                }],
+                extends: None,
+                implements: vec![],
+                members: vec![],
+                line: 1,
+                end_line: 5,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::Annotation,
+            match_fields: [(
+                "name".to_string(),
+                MatchValue::Single("RestController".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J009", Severity::Minor, "no {name}");
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].message, "no RestController");
+        assert_eq!(vs[0].line, 1);
+    }
+
+    #[test]
+    fn match_field_declaration() {
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "C".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::FieldDeclaration(FieldDecl {
+                    name: "myField".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    field_type: Some("int".to_string()),
+                    initializer: None,
+                    line: 3,
+                })],
+                line: 1,
+                end_line: 10,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::FieldDeclaration,
+            match_fields: [(
+                "field_type".to_string(),
+                MatchValue::Single("int".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(
+            &pattern,
+            &unit,
+            "T.java",
+            "J007",
+            Severity::Minor,
+            "field {name} type {field_type}",
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].message, "field myField type int");
+    }
+
+    #[test]
+    fn match_class_decl_with_modifier() {
+        let unit = make_unit(); // badName 类, public 修饰符
+        let pattern = Pattern {
+            kind: PatternKind::ClassDeclaration,
+            match_fields: [(
+                "modifier".to_string(),
+                MatchValue::Single("public".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(
+            &pattern,
+            &unit,
+            "Test.java",
+            "J004",
+            Severity::Minor,
+            "class {name} mod {modifier}",
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].message, "class badName mod public");
+    }
+
+    #[test]
+    fn match_method_decl_return_type() {
+        let unit = make_unit(); // doStuff 返回 void
+        let pattern = Pattern {
+            kind: PatternKind::MethodDeclaration,
+            match_fields: [(
+                "return_type".to_string(),
+                MatchValue::Single("void".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(
+            &pattern,
+            &unit,
+            "Test.java",
+            "J005",
+            Severity::Minor,
+            "method returns {return_type}",
+        );
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].message, "method returns void");
+    }
+
+    #[test]
+    fn match_import_package_glob() {
+        let unit = make_unit();
+        let pattern = Pattern {
+            kind: PatternKind::Import,
+            match_fields: [(
+                "package".to_string(),
+                MatchValue::Single("java.util.*".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "Test.java", "J003", Severity::Minor, "import {package}");
+        // glob `java.util.*` 同时命中 `java.util.*` 与 `java.util.List`
+        assert_eq!(vs.len(), 2);
+        let msgs: Vec<&str> = vs.iter().map(|v| v.message.as_str()).collect();
+        assert!(msgs.contains(&"import java.util.*"), "got: {msgs:?}");
+        assert!(msgs.contains(&"import java.util.List"), "got: {msgs:?}");
+    }
+
+    #[test]
+    fn match_method_call_in_arguments() {
+        // System.out.println(foo()) —— 嵌套调用应被递归检出
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "C".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::MethodDeclaration(MethodDecl {
+                    name: "m".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    return_type: None,
+                    parameters: vec![],
+                    body: Some(BlockStmt {
+                        statements: vec![Stmt::ExpressionStmt(ExprStmt {
+                            expr: Expr::MethodCallExpr(MethodCallExpr {
+                                callee: Some("System.out".to_string()),
+                                method_name: "println".to_string(),
+                                arguments: vec![Expr::MethodCallExpr(MethodCallExpr {
+                                    callee: None,
+                                    method_name: "foo".to_string(),
+                                    arguments: vec![],
+                                    line: 6,
+                                })],
+                                line: 5,
+                            }),
+                            line: 5,
+                        })],
+                        line: 4,
+                        end_line: 7,
+                    }),
+                    line: 4,
+                    end_line: 7,
+                })],
+                line: 1,
+                end_line: 8,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::MethodCall,
+            match_fields: [
+                ("callee".to_string(), MatchValue::Single("System.out".to_string())),
+                ("method".to_string(), MatchValue::Single("println".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J001", Severity::Minor, "call");
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].line, 5);
+    }
+
+    #[test]
+    fn match_method_call_in_nested_class() {
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "Outer".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::ClassDeclaration(ClassDecl {
+                    name: "Inner".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    extends: None,
+                    implements: vec![],
+                    members: vec![MemberDecl::MethodDeclaration(MethodDecl {
+                        name: "inner".to_string(),
+                        modifiers: vec![],
+                        annotations: vec![],
+                        return_type: None,
+                        parameters: vec![],
+                        body: Some(BlockStmt {
+                            statements: vec![Stmt::ExpressionStmt(ExprStmt {
+                                expr: Expr::MethodCallExpr(MethodCallExpr {
+                                    callee: Some("System.out".to_string()),
+                                    method_name: "println".to_string(),
+                                    arguments: vec![],
+                                    line: 11,
+                                }),
+                                line: 11,
+                            })],
+                            line: 10,
+                            end_line: 12,
+                        }),
+                        line: 10,
+                        end_line: 12,
+                    })],
+                    line: 8,
+                    end_line: 14,
+                })],
+                line: 1,
+                end_line: 16,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::MethodCall,
+            match_fields: [
+                ("callee".to_string(), MatchValue::Single("System.out".to_string())),
+                ("method".to_string(), MatchValue::Single("println".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J001", Severity::Minor, "call");
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].line, 11);
+    }
+
+    #[test]
+    fn match_any_of_no_match_yields_no_violation() {
+        let unit = make_unit(); // callee 是 System.out
+        let pattern = Pattern {
+            kind: PatternKind::MethodCall,
+            match_fields: [
+                (
+                    "callee".to_string(),
+                    MatchValue::Any(vec!["System.err".to_string()]),
+                ),
+                ("method".to_string(), MatchValue::Single("println".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "Test.java", "J001", Severity::Minor, "x");
+        assert_eq!(vs.len(), 0);
+    }
+
+    #[test]
+    fn match_class_decl_nested_class() {
+        // 嵌套类名称违反 PascalCase 也应被 ClassDeclaration 递归检出
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "Outer".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::ClassDeclaration(ClassDecl {
+                    name: "innerBad".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    extends: None,
+                    implements: vec![],
+                    members: vec![],
+                    line: 8,
+                    end_line: 14,
+                })],
+                line: 1,
+                end_line: 16,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::ClassDeclaration,
+            match_fields: [(
+                "name".to_string(),
+                MatchValue::Single("^[a-z]".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J004", Severity::Minor, "bad class {name}");
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].line, 8);
+        assert_eq!(vs[0].message, "bad class innerBad");
     }
 }

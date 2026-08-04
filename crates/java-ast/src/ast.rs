@@ -8,7 +8,8 @@ pub struct CompilationUnit {
     pub package: Option<String>,
     pub imports: Vec<ImportDecl>,
     pub types: Vec<TypeDecl>,
-    #[serde(default)]
+    // JavaParser 侧输出的是驼峰 `sourceFile`，这里用 alias 兼容两种写法。
+    #[serde(default, alias = "sourceFile")]
     pub source_file: String,
     #[serde(default)]
     pub source_lines: Vec<String>,
@@ -21,9 +22,11 @@ pub struct CompilationUnit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportDecl {
     pub package: String,
-    #[serde(default)]
+    // JavaParser 侧输出驼峰 `isWildcard` / `isStatic`。
+    // 缺少 alias 时会静默落到 default(false)，导致 J003（禁止通配符 import）永不触发。
+    #[serde(default, alias = "isWildcard")]
     pub is_wildcard: bool,
-    #[serde(default)]
+    #[serde(default, alias = "isStatic")]
     pub is_static: bool,
     pub line: usize,
 }
@@ -219,6 +222,7 @@ pub enum Stmt {
     VariableDeclarationStmt(VarDeclStmt),
     IfStmt(IfStmt),
     ForStmt(ForStmt),
+    ForEachStmt(ForEachStmt),
     WhileStmt(WhileStmt),
     DoStmt(DoStmt),
     TryStmt(TryStmt),
@@ -282,6 +286,18 @@ pub struct ForStmt {
     pub condition: Option<Expr>,
     #[serde(default)]
     pub update: Vec<Expr>,
+    pub body: Box<Stmt>,
+    pub line: usize,
+}
+
+/// enhanced for 语句（for-each）。
+/// `for (Type var : iterable) body`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForEachStmt {
+    /// 循环变量声明，JavaParser 输出为 VariableDeclarationExpr。
+    pub variable: Expr,
+    /// 被迭代的表达式（集合/数组）。
+    pub iterable: Expr,
     pub body: Box<Stmt>,
     pub line: usize,
 }
@@ -414,6 +430,10 @@ pub enum Expr {
     InstanceOfExpr(InstanceOfExpr),
     LambdaExpr(LambdaExpr),
     MethodReferenceExpr(MethodReferenceExpr),
+    /// for 循环的初始化声明（如 `for (int i = 0; ...)`）。
+    /// 复用 `VarDeclStmt` 结构承载 `var_type`/`declarations`/`line`。
+    #[serde(rename = "VariableDeclarationExpr")]
+    VariableDeclarationExpr(VarDeclStmt),
     EnclosedExpr(Box<Expr>),
 }
 
@@ -559,4 +579,210 @@ pub struct MethodReferenceExpr {
     pub target: Option<String>,
     pub method: String,
     pub line: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_unit() -> CompilationUnit {
+        CompilationUnit {
+            package: Some("com.example".to_string()),
+            imports: vec![ImportDecl {
+                package: "java.util".to_string(),
+                is_wildcard: false,
+                is_static: false,
+                line: 1,
+            }],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "Foo".to_string(),
+                modifiers: vec!["public".to_string()],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::MethodDeclaration(MethodDecl {
+                    name: "bar".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    return_type: Some("void".to_string()),
+                    parameters: vec![],
+                    body: Some(BlockStmt {
+                        statements: vec![],
+                        line: 2,
+                        end_line: 4,
+                    }),
+                    line: 2,
+                    end_line: 4,
+                })],
+                line: 1,
+                end_line: 5,
+            })],
+            source_file: "Foo.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        }
+    }
+
+    /// 手工构造的 AST 应可正常逐层导航（校验模型结构本身）。
+    ///
+    /// 注意：这里只做「构造 + 读取」，不做 `serde_json::to_string`。
+    /// `Expr`/`Stmt` 是相互递归的 internally-tagged 枚举，对其做序列化会让
+    /// serde 的 `TaggedSerializer` 在单态化阶段无限嵌套（编译期 recursion limit），
+    /// 而本项目里 AST 只从 JavaParser 的 JSON **反序列化**，不反向序列化。
+    #[test]
+    fn sample_unit_structure_is_navigable() {
+        let unit = sample_unit();
+        assert_eq!(unit.package.as_deref(), Some("com.example"));
+        assert_eq!(unit.imports.len(), 1);
+        assert_eq!(unit.imports[0].package, "java.util");
+        assert_eq!(unit.source_file, "Foo.java");
+        match &unit.types[0] {
+            TypeDecl::ClassDeclaration(c) => {
+                assert_eq!(c.name, "Foo");
+                assert_eq!(c.modifiers, vec!["public".to_string()]);
+                assert_eq!(c.line, 1);
+                assert_eq!(c.end_line, 5);
+                match &c.members[0] {
+                    MemberDecl::MethodDeclaration(m) => {
+                        assert_eq!(m.name, "bar");
+                        assert_eq!(m.return_type.as_deref(), Some("void"));
+                        assert_eq!(m.body.as_ref().unwrap().end_line, 4);
+                    }
+                    _ => panic!("expected MethodDeclaration"),
+                }
+            }
+            _ => panic!("expected ClassDeclaration"),
+        }
+    }
+
+    /// 解析器输出的完整 JSON 应能反序列化成 `CompilationUnit`（真实使用路径）。
+    #[test]
+    fn compilation_unit_deserializes_from_parser_json() {
+        let v = json!({
+            "package": "com.example",
+            "imports": [
+                { "package": "java.util", "is_wildcard": true, "line": 3 }
+            ],
+            "types": [{
+                "kind": "ClassDeclaration",
+                "name": "Foo",
+                "modifiers": ["public"],
+                "line": 5,
+                "end_line": 12,
+                "members": [{
+                    "kind": "MethodDeclaration",
+                    "name": "bar",
+                    "return_type": "void",
+                    "line": 6,
+                    "end_line": 9,
+                    "body": { "statements": [], "line": 6, "end_line": 9 }
+                }]
+            }],
+            "source_file": "Foo.java"
+        });
+        let unit: CompilationUnit = serde_json::from_value(v).unwrap();
+        assert_eq!(unit.package.as_deref(), Some("com.example"));
+        assert!(unit.imports[0].is_wildcard);
+        assert_eq!(unit.source_file, "Foo.java");
+        match &unit.types[0] {
+            TypeDecl::ClassDeclaration(c) => {
+                assert_eq!(c.name, "Foo");
+                assert_eq!(c.end_line, 12);
+                assert_eq!(c.members.len(), 1);
+            }
+            _ => panic!("expected ClassDeclaration"),
+        }
+    }
+
+    /// `raw_json` 标了 `#[serde(skip)]`：即使 JSON 里带该字段也不会被读入。
+    #[test]
+    fn raw_json_field_is_skipped_by_serde() {
+        let v = json!({
+            "package": null,
+            "imports": [],
+            "types": [],
+            "raw_json": "should-be-ignored"
+        });
+        let unit: CompilationUnit = serde_json::from_value(v).unwrap();
+        assert!(unit.raw_json.is_empty(), "raw_json 应被 serde skip，不从 JSON 读取");
+    }
+
+    #[test]
+    fn typedecl_tag_deserialization() {
+        let v = json!({
+            "kind": "ClassDeclaration",
+            "name": "X",
+            "line": 1,
+            "end_line": 2,
+            "members": []
+        });
+        let td: TypeDecl = serde_json::from_value(v).unwrap();
+        match td {
+            TypeDecl::ClassDeclaration(c) => assert_eq!(c.name, "X"),
+            _ => panic!("expected ClassDeclaration"),
+        }
+    }
+
+    #[test]
+    fn memberdecl_tag_deserialization() {
+        let v = json!({
+            "kind": "FieldDeclaration",
+            "name": "count",
+            "field_type": "int",
+            "line": 3
+        });
+        let m: MemberDecl = serde_json::from_value(v).unwrap();
+        match m {
+            MemberDecl::FieldDeclaration(f) => assert_eq!(f.name, "count"),
+            _ => panic!("expected FieldDeclaration"),
+        }
+    }
+
+    #[test]
+    fn stmt_tag_deserialization() {
+        let v = json!({
+            "kind": "ExpressionStmt",
+            "line": 1,
+            "expr": { "kind": "NameExpr", "name": "x", "line": 1 }
+        });
+        let s: Stmt = serde_json::from_value(v).unwrap();
+        match s {
+            Stmt::ExpressionStmt(es) => match es.expr {
+                Expr::NameExpr(n) => assert_eq!(n.name, "x"),
+                _ => panic!("expected NameExpr"),
+            },
+            _ => panic!("expected ExpressionStmt"),
+        }
+    }
+
+    /// 回归测试：JavaParser 输出的是驼峰 `isWildcard`/`isStatic`/`sourceFile`。
+    ///
+    /// 早期只声明了 snake_case 字段 + `#[serde(default)]`，驼峰键被静默忽略，
+    /// 导致 `is_wildcard` 恒为 false、J003（禁止通配符 import）永远不触发。
+    #[test]
+    fn camel_case_keys_from_java_parser_are_accepted() {
+        let v = json!({
+            "package": "com.example",
+            "imports": [
+                { "package": "java.util.*", "isWildcard": true, "isStatic": false, "line": 3 },
+                { "package": "java.util.Objects.requireNonNull", "isWildcard": false, "isStatic": true, "line": 4 }
+            ],
+            "types": [],
+            "sourceFile": "Foo.java"
+        });
+        let unit: CompilationUnit = serde_json::from_value(v).unwrap();
+        assert!(unit.imports[0].is_wildcard, "驼峰 isWildcard 应被识别");
+        assert!(unit.imports[1].is_static, "驼峰 isStatic 应被识别");
+        assert_eq!(unit.source_file, "Foo.java", "驼峰 sourceFile 应被识别");
+    }
+
+    #[test]
+    fn import_defaults_apply() {
+        // 缺少 is_wildcard/is_static 时应取默认值 false
+        let v = json!({ "package": "java.util", "line": 1 });
+        let imp: ImportDecl = serde_json::from_value(v).unwrap();
+        assert!(!imp.is_wildcard);
+        assert!(!imp.is_static);
+    }
 }

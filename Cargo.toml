@@ -44,3 +44,6 @@ anyhow = "1"
 [[bin]]
 name = "java-guard"
 path = "src/main.rs"
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -7,8 +7,10 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
  * CLI 入口：解析 .java 文件，输出 JSON AST 到 stdout。
@@ -22,25 +24,21 @@ public class Main {
         String format = "json";
 
         for (int i = 0; i < args.length; i++) {
-            switch (args[i]) {
-                case "--input", "-i" -> {
-                    if (i + 1 < args.length) {
-                        inputPath = args[++i];
-                    }
+            String arg = args[i];
+            if (arg.equals("--input") || arg.equals("-i")) {
+                if (i + 1 < args.length) {
+                    inputPath = args[++i];
                 }
-                case "--format", "-f" -> {
-                    if (i + 1 < args.length) {
-                        format = args[++i];
-                    }
+            } else if (arg.equals("--format") || arg.equals("-f")) {
+                if (i + 1 < args.length) {
+                    format = args[++i];
                 }
-                case "--help", "-h" -> {
-                    printHelp();
-                    return;
-                }
-                default -> {
-                    System.err.println("Unknown argument: " + args[i]);
-                    System.exit(2);
-                }
+            } else if (arg.equals("--help") || arg.equals("-h")) {
+                printHelp();
+                return;
+            } else {
+                System.err.println("Unknown argument: " + arg);
+                System.exit(2);
             }
         }
 
@@ -50,8 +48,8 @@ public class Main {
         }
 
         try {
-            Path file = Path.of(inputPath);
-            String source = Files.readString(file);
+            Path file = Paths.get(inputPath);
+            String source = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
             String filename = file.getFileName().toString();
 
             JavaParser parser = new JavaParser();
@@ -65,7 +63,8 @@ public class Main {
                 System.exit(1);
             }
 
-            CompilationUnit cu = result.getResult().orElseThrow();
+            CompilationUnit cu = result.getResult().orElseThrow(
+                () -> new RuntimeException("parser produced no compilation unit"));
 
             AstSerializer serializer = new AstSerializer();
             Object astJson = serializer.serialize(cu, filename);

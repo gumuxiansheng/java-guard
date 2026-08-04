@@ -142,14 +142,17 @@ impl ConsoleReporter {
 
             for v in vs {
                 let sev = severity_color(v.severity);
-                let end = v.end_line.map(|e| format!("-{e}")).unwrap_or_default();
+                // 位置串：单行为 `8`，跨行为 `8-9`；冒号统一作为位置与级别的分隔符。
+                let loc = match v.end_line {
+                    Some(end) if end > v.line => format!("{}-{}", v.line, end),
+                    _ => v.line.to_string(),
+                };
 
                 writeln!(
                     w,
-                    "  {}{}:{}{} {}{}{}",
+                    "  {}{}:{} {}{}{}",
                     color::GRAY,
-                    v.line,
-                    end,
+                    loc,
                     color::RESET,
                     sev,
                     v.severity,
@@ -615,5 +618,73 @@ mod tests {
             !ts.starts_with("1970-01-01T00:00:"),
             "timestamp {ts} 不应是旧的非法格式"
         );
+    }
+
+    #[test]
+    fn sarif_severity_levels_mapping() {
+        let vs = vec![
+            Violation::new("J1", Severity::Critical, "A.java", 1, "c"),
+            Violation::new("J2", Severity::Major, "A.java", 2, "m"),
+            Violation::new("J3", Severity::Minor, "A.java", 3, "i"),
+            Violation::new("J4", Severity::Info, "A.java", 4, "n"),
+        ];
+        let sarif = SarifReporter::build_sarif(&vs);
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results[0]["level"], "error");
+        assert_eq!(results[1]["level"], "error");
+        assert_eq!(results[2]["level"], "warning");
+        assert_eq!(results[3]["level"], "note");
+    }
+
+    #[test]
+    fn sarif_includes_distinct_rules() {
+        let vs = vec![
+            Violation::new("J001", Severity::Minor, "A.java", 1, "a"),
+            Violation::new("J001", Severity::Minor, "A.java", 2, "b"),
+            Violation::new("J002", Severity::Major, "B.java", 1, "c"),
+        ];
+        let sarif = SarifReporter::build_sarif(&vs);
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn sarif_region_endline() {
+        let vs = vec![Violation {
+            rule_id: "J001".into(),
+            severity: Severity::Minor,
+            file: "A.java".to_string(),
+            line: 8,
+            end_line: Some(9),
+            message: "x".to_string(),
+        }];
+        let sarif = SarifReporter::build_sarif(&vs);
+        let region = &sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 8);
+        assert_eq!(region["endLine"], 9);
+    }
+
+    #[test]
+    fn json_report_includes_end_line() {
+        let mut v = Violation::new("J001", Severity::Minor, "A.java", 8, "x");
+        v.end_line = Some(9);
+        let vs = vec![v];
+        let mut buf = Vec::new();
+        JsonReporter::report_to(&mut buf, &vs, 1, 0, None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(parsed["violations"][0]["end_line"], 9);
+    }
+
+    #[test]
+    fn console_report_shows_line_range() {
+        let mut v = Violation::new("J001", Severity::Minor, "A.java", 8, "x");
+        v.end_line = Some(9);
+        let vs = vec![v];
+        let mut buf = Vec::new();
+        ConsoleReporter::report_to(&mut buf, &vs, 0, 0, None).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("8-9"), "expected line range 8-9 in: {out}");
     }
 }
