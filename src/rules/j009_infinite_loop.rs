@@ -231,6 +231,10 @@ fn collect_facts_stmt(s: &Stmt, bools: &mut Vec<(String, bool)>, re: &mut HashSe
                 collect_facts_expr(u, bools, re);
             }
         }
+        Stmt::ForEachStmt(fe) => {
+            collect_facts_stmt(&fe.body, bools, re);
+            collect_facts_expr(&fe.iterable, bools, re);
+        }
         Stmt::WhileStmt(w) => {
             collect_facts_stmt(&w.body, bools, re);
             collect_facts_expr(&w.condition, bools, re);
@@ -266,10 +270,6 @@ fn collect_facts_stmt(s: &Stmt, bools: &mut Vec<(String, bool)>, re: &mut HashSe
             }
         }
         Stmt::ThrowStmt(ts) => collect_facts_expr(&ts.expr, bools, re),
-        Stmt::ForEachStmt(fes) => {
-            collect_facts_stmt(&fes.body, bools, re);
-            collect_facts_expr(&fes.iterable, bools, re);
-        }
         _ => {}
     }
 }
@@ -339,6 +339,11 @@ fn visit_stmt(stmt: &Stmt, file: &str, out: &mut Vec<Violation>, ctx: &ConstCtx)
                 visit_expr(u, file, out);
             }
         }
+        Stmt::ForEachStmt(fe) => {
+            // for-each 本身不因条件恒定而死循环（迭代器耗尽即退出），只递归检查体与迭代表达式。
+            visit_expr(&fe.iterable, file, out);
+            visit_stmt(&fe.body, file, out, ctx);
+        }
         Stmt::WhileStmt(ws) => {
             check_loop(file, out, LoopRef::While(ws), ctx);
             visit_stmt(&ws.body, file, out, ctx);
@@ -348,12 +353,6 @@ fn visit_stmt(stmt: &Stmt, file: &str, out: &mut Vec<Violation>, ctx: &ConstCtx)
             check_loop(file, out, LoopRef::Do(ds), ctx);
             visit_stmt(&ds.body, file, out, ctx);
             visit_expr(&ds.condition, file, out);
-        }
-        Stmt::ForEachStmt(fes) => {
-            // for-each 循环不作为死循环检测目标（迭代器有天然终止条件）
-            // 但仍需递归遍历循环体和迭代表达式
-            visit_stmt(&fes.body, file, out, ctx);
-            visit_expr(&fes.iterable, file, out);
         }
         Stmt::BlockStmt(b) => {
             for s in &b.statements {
@@ -537,11 +536,13 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
     // 2) #1：for 缺少更新表达式，且条件依赖的循环变量在循环体内未被修改
     if is_for && update.is_empty() {
         let dependent = init_vars.iter().any(|v| cond_names.contains(v));
-        let none_mutated = init_vars.iter().all(|v| !body_mut.contains(v));
+        // 检查条件中出现的**所有**变量（含 init 之外的变量）：若 `n` 在循环体内被修改，
+        // `for (int i = 0; i < n; ) { n--; }` 仍可终止，不应误报。
+        let none_mutated = cond_names.iter().all(|v| !body_mut.contains(v));
         if dependent && none_mutated {
             let vars = init_vars.join(", ");
             let msg = format!(
-                "for 循环缺少更新表达式（update），循环变量 [{vars}] 在条件中使用但循环体内未被修改，且无 break/return/throw 退出：计数器不会推进，可能死循环"
+                "for 循环缺少更新表达式（update），循环变量 [{vars}] 在条件中使用且条件涉及的所有变量在循环体内均未被修改，且无 break/return/throw 退出：计数器不会推进，可能死循环"
             );
             out.push(Violation::new("J009", Severity::Major, file, line, &msg));
             return;
@@ -549,37 +550,37 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
     }
 
     // 2b) #1b：for 有 update 但更新无效（i = i / i = 0 / i += 0）
-    if is_for && !update.is_empty() {
-        if cond.is_some() {
-            let ineffective = update.iter().any(|u| is_ineffective_update(u, &init_vars));
-            if ineffective {
-                // 检查条件依赖的循环变量是否在 update 中被无效更新
-                let ineffective_vars: Vec<&String> = update
-                    .iter()
-                    .filter_map(|u| ineffective_update_target(u))
-                    .collect();
-                let cond_uses_ineffective = ineffective_vars
-                    .iter()
-                    .any(|v| cond_names.contains(v.as_str()));
-                if cond_uses_ineffective {
-                    let vars = ineffective_vars
-                        .iter()
-                        .map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let msg = format!(
-                        "for 循环的更新表达式对循环变量 [{vars}] 无实际效果（如 i = i / i = 0 / i += 0），条件永远不会因更新而变为 false，且无 break/return/throw 退出：可能死循环"
-                    );
-                    out.push(Violation::new("J009", Severity::Major, file, line, &msg));
-                    return;
-                }
-            }
+    if is_for && !update.is_empty() && cond.is_some() && cond_val != Some(false) {
+        // 涉及条件变量的更新条目（其它变量的更新不影响循环条件）。
+        let cond_updates: Vec<&Expr> = update
+            .iter()
+            .filter(|u| update_target(u).is_some_and(|v| cond_names.contains(v.as_str())))
+            .collect();
+        // 仅当「涉及条件变量的所有更新」都无效时才报：
+        // - `i = 0, i++` 中 i++ 仍能让循环推进，不能因为 i = 0 而误报；
+        // - `for (int i = 10; i > 0; i = 0)` 中 i = 0 使条件立即为 false，循环正常终止。
+        if !cond_updates.is_empty()
+            && cond_updates
+                .iter()
+                .all(|u| is_ineffective_update(u, &init_ints))
+        {
+            let vars = cond_updates
+                .iter()
+                .filter_map(|u| update_target(u))
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let msg = format!(
+                "for 循环的更新表达式对循环变量 [{vars}] 无实际效果（如 i = i / i = 0 / i += 0），条件永远不会因更新而变为 false，且无 break/return/throw 退出：可能死循环"
+            );
+            out.push(Violation::new("J009", Severity::Major, file, line, &msg));
+            return;
         }
     }
 
     // 2c) #1c：for update 方向与条件矛盾（i < N 但 i-- / i > 0 但 i++）
     if is_for && !update.is_empty() {
-        if let Some(ref cond_expr) = cond {
+        if let Some(cond_expr) = cond {
             if let Some(violation) = check_update_direction_conflict(cond_expr, update, &init_ints) {
                 out.push(Violation::new(
                     "J009",
@@ -832,6 +833,10 @@ fn collect_names_stmt(s: &Stmt, set: &mut HashSet<String>) {
                 collect_names(u, set);
             }
         }
+        Stmt::ForEachStmt(fe) => {
+            collect_names_stmt(&fe.body, set);
+            collect_names(&fe.iterable, set);
+        }
         Stmt::WhileStmt(w) => {
             collect_names_stmt(&w.body, set);
             collect_names(&w.condition, set);
@@ -923,6 +928,10 @@ fn collect_mutated_stmt(s: &Stmt, set: &mut HashSet<String>) {
                 collect_mutated_expr(u, set);
             }
         }
+        Stmt::ForEachStmt(fe) => {
+            collect_mutated_stmt(&fe.body, set);
+            collect_mutated_expr(&fe.iterable, set);
+        }
         Stmt::WhileStmt(w) => {
             collect_mutated_stmt(&w.body, set);
             collect_mutated_expr(&w.condition, set);
@@ -966,11 +975,6 @@ fn collect_mutated_stmt(s: &Stmt, set: &mut HashSet<String>) {
             }
         }
         Stmt::ThrowStmt(ts) => collect_mutated_expr(&ts.expr, set),
-        Stmt::ForEachStmt(fes) => {
-            // for-each 循环变量在循环体内的修改不影响外部迭代变量
-            collect_mutated_stmt(&fes.body, set);
-            collect_mutated_expr(&fes.iterable, set);
-        }
         _ => {}
     }
 }
@@ -1078,8 +1082,11 @@ fn extract_init_ints(init: &Option<Expr>) -> HashMap<String, i64> {
 // ---------------------------------------------------------------------------
 
 /// 判断 update 表达式是否对变量无实际效果。
-/// 检测模式：`i = i` / `i = <const>` (重置为常量) / `i += 0` / `i -= 0` / `i *= 1` / `i /= 1`
-fn is_ineffective_update(u: &Expr, _init_vars: &[String]) -> bool {
+/// 检测模式：`i = i` / `i = <初始值>`（重置回初始值）/ `i += 0` / `i -= 0` / `i *= 1` / `i /= 1`。
+/// `i = <const>` 仅在 const 等于循环变量初始值时才是无效更新：
+/// `for (int i = 0; i < 10; i = 0)` 重置回 0 无进展；而 `for (int i = 10; i > 0; i = 0)`
+/// 使条件立即为 false，循环正常终止，不能算无效。
+fn is_ineffective_update(u: &Expr, init_ints: &HashMap<String, i64>) -> bool {
     match u {
         // i = i  (自赋值)
         Expr::AssignExpr(ae) if ae.op == "=" => {
@@ -1088,10 +1095,12 @@ fn is_ineffective_update(u: &Expr, _init_vars: &[String]) -> bool {
             {
                 return target.name == value.name;
             }
-            // i = 0 (重置为常量，如果 0 是初始值则循环不变)
-            if let Expr::LiteralExpr(l) = ae.value.as_ref() {
-                if let Ok(n) = l.value.parse::<i64>() {
-                    return n == 0;
+            // i = <const>：仅当重置为初始值才无效
+            if let (Expr::NameExpr(target), Expr::LiteralExpr(l)) =
+                (ae.target.as_ref(), ae.value.as_ref())
+            {
+                if let Ok(n) = l.value.trim_end_matches(['L', 'l']).parse::<i64>() {
+                    return init_ints.get(&target.name).copied() == Some(n);
                 }
             }
             false
@@ -1099,7 +1108,7 @@ fn is_ineffective_update(u: &Expr, _init_vars: &[String]) -> bool {
         // i += 0 / i -= 0
         Expr::AssignExpr(ae) if ae.op == "+=" || ae.op == "-=" => {
             if let Expr::LiteralExpr(l) = ae.value.as_ref() {
-                if let Ok(n) = l.value.parse::<i64>() {
+                if let Ok(n) = l.value.trim_end_matches(['L', 'l']).parse::<i64>() {
                     return n == 0;
                 }
             }
@@ -1108,7 +1117,7 @@ fn is_ineffective_update(u: &Expr, _init_vars: &[String]) -> bool {
         // i *= 1 / i /= 1
         Expr::AssignExpr(ae) if ae.op == "*=" || ae.op == "/=" => {
             if let Expr::LiteralExpr(l) = ae.value.as_ref() {
-                if let Ok(n) = l.value.parse::<i64>() {
+                if let Ok(n) = l.value.trim_end_matches(['L', 'l']).parse::<i64>() {
                     return n == 1;
                 }
             }
@@ -1119,11 +1128,18 @@ fn is_ineffective_update(u: &Expr, _init_vars: &[String]) -> bool {
     }
 }
 
-/// 返回无效 update 的目标变量名。
-fn ineffective_update_target(u: &Expr) -> Option<&String> {
+/// 返回 update 表达式修改的变量名（赋值或自增/自减），非变量更新返回 None。
+fn update_target(u: &Expr) -> Option<&String> {
     match u {
         Expr::AssignExpr(ae) => {
             if let Expr::NameExpr(n) = ae.target.as_ref() {
+                Some(&n.name)
+            } else {
+                None
+            }
+        }
+        Expr::UnaryExpr(ue) if ue.op == "++" || ue.op == "--" => {
+            if let Expr::NameExpr(n) = ue.expr.as_ref() {
                 Some(&n.name)
             } else {
                 None
@@ -1169,12 +1185,12 @@ fn check_update_direction_conflict(
 
         let init_val = init_ints.get(&var_name)?;
 
-        // 找到对该变量的 update 表达式
+        // 找到对该变量的 update 表达式；无关变量的更新（如 `j++`）直接跳过，
+        // 不能提前中止整个检查（否则 `for (int i = 0; i < 10; j++, i--)` 会漏报）。
         for u in update {
-            let (delta, is_increment) = analyze_update_delta(u, &var_name)?;
-            if !is_increment {
+            let Some((delta, _is_relevant)) = analyze_update_delta(u, &var_name) else {
                 continue;
-            }
+            };
 
             // 判断方向是否矛盾
             let enters_loop = match op {
@@ -1204,7 +1220,7 @@ fn check_update_direction_conflict(
 }
 
 /// 分析 update 表达式对变量的数值变化量。
-/// 返回 (delta, is_relevant) — is_relevant=false 表示不是对该变量的更新。
+/// 返回 `(delta, true)`；若该表达式不是对此变量的更新，返回 None。
 fn analyze_update_delta(u: &Expr, var: &str) -> Option<(i64, bool)> {
     match u {
         // i++ → delta=1
@@ -1319,6 +1335,12 @@ fn loop_has_exit_stmt(stmt: &Stmt, rel: usize, in_lambda: bool) -> bool {
                     .map_or(false, |c| loop_has_exit_expr(c, rel + 1, in_lambda))
                 || f.update.iter().any(|u| loop_has_exit_expr(u, rel + 1, in_lambda))
         }
+        Stmt::ForEachStmt(fe) => {
+            // for-each 自身是循环：体内的 break 只退出 for-each（rel+1）；
+            // return / throw 仍会传播出方法（与 ForStmt 处理一致）。
+            loop_has_exit_stmt(&fe.body, rel + 1, in_lambda)
+                || loop_has_exit_expr(&fe.iterable, rel + 1, in_lambda)
+        }
         Stmt::WhileStmt(w) => {
             loop_has_exit_stmt(&w.body, rel + 1, in_lambda)
                 || loop_has_exit_expr(&w.condition, rel + 1, in_lambda)
@@ -1363,10 +1385,6 @@ fn loop_has_exit_stmt(stmt: &Stmt, rel: usize, in_lambda: bool) -> bool {
             .iter()
             .any(|d| d.initializer.as_ref().map_or(false, |i| loop_has_exit_expr(i, rel, in_lambda))),
         Stmt::ContinueStmt(_) => false,
-        Stmt::ForEachStmt(fes) => {
-            // for-each 循环体中的 break/return/throw 同样算退出路径
-            loop_has_exit_stmt(&fes.body, rel + 1, in_lambda)
-        }
         _ => false,
     }
 }
@@ -1943,6 +1961,156 @@ mod tests {
         let vs = InfiniteLoopRule::new().check_unit(&unit);
         assert_eq!(vs.len(), 1, "i = i 自赋值应报 #1b");
         assert!(vs[0].message.contains("无实际效果"), "应给出 #1b 提示");
+    }
+
+    // ---- #1b 回归：无效 update 必须考虑初始值与入口条件 ----
+
+    #[test]
+    fn ignores_for_reset_to_non_initial_value() {
+        // for (int i = 10; i > 0; i = 0) —— i = 0 使条件立即为 false，循环正常终止
+        let f = for_loop(
+            Some(int_var_init("i", "10")),
+            Some(bin(">", name("i"), int_lit("0"))),
+            vec![assign_update("i", "=", int_lit("0"))],
+            empty_block(),
+        );
+        let unit = unit_with(vec![f]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 0, "i = 0 与初始值 10 不同，循环可正常终止，不应报 #1b");
+    }
+
+    #[test]
+    fn ignores_for_ineffective_update_never_entered() {
+        // for (int i = 10; i < 10; i = 0) —— 入口条件为 false，循环体根本不执行
+        let f = for_loop(
+            Some(int_var_init("i", "10")),
+            Some(bin("<", name("i"), int_lit("10"))),
+            vec![assign_update("i", "=", int_lit("0"))],
+            empty_block(),
+        );
+        let unit = unit_with(vec![f]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 0, "入口条件恒 false 的循环不应报死循环");
+    }
+
+    #[test]
+    fn ignores_for_effective_update_alongside_ineffective() {
+        // for (int i = 0; i < 10; i = 0, i++) —— i++ 仍能推进，循环可终止
+        let f = for_loop(
+            Some(int_var_init("i", "0")),
+            Some(bin("<", name("i"), int_lit("10"))),
+            vec![assign_update("i", "=", int_lit("0")), unary_inc("i")],
+            empty_block(),
+        );
+        let unit = unit_with(vec![f]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 0, "i = 0 与 i++ 并存时循环仍会推进，不应报 #1b");
+    }
+
+    // ---- #1 回归：条件中的非 init 变量被修改时不应误报 ----
+
+    #[test]
+    fn ignores_for_cond_var_mutated_in_body() {
+        // for (int i = 0; i < n; ) { n -= 1; } —— n 递减使条件终将变为 false
+        let dec = Stmt::ExpressionStmt(ExprStmt {
+            expr: Expr::AssignExpr(AssignExpr {
+                target: Box::new(name("n")),
+                op: "-=".to_string(),
+                value: Box::new(int_lit("1")),
+                line: 2,
+            }),
+            line: 2,
+        });
+        let f = for_loop(
+            Some(int_var_init("i", "0")),
+            Some(bin("<", name("i"), name("n"))),
+            vec![],
+            body_with(vec![dec]),
+        );
+        let unit = unit_with(vec![f]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 0, "条件变量 n 在循环体内被修改，循环可能终止，不应报 #1");
+    }
+
+    // ---- #1c 回归：无关变量的 update 不应中断方向矛盾检测 ----
+
+    #[test]
+    fn detects_direction_conflict_with_unrelated_update_first() {
+        // for (int i = 0, j = 0; i < 10; j++, i--) —— j++ 在前，i-- 仍需被检出
+        let multi = Expr::VariableDeclarationExpr(VarDeclStmt {
+            var_type: Some("int".to_string()),
+            declarations: vec![
+                VarDeclarator {
+                    name: "i".to_string(),
+                    initializer: Some(int_lit("0")),
+                },
+                VarDeclarator {
+                    name: "j".to_string(),
+                    initializer: Some(int_lit("0")),
+                },
+            ],
+            line: 1,
+        });
+        let f = for_loop(
+            Some(multi),
+            Some(bin("<", name("i"), int_lit("10"))),
+            vec![unary_inc("j"), unary_dec("i")],
+            empty_block(),
+        );
+        let unit = unit_with(vec![f]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 1, "j++ 之后 i-- 与 i < 10 矛盾仍应检出 #1c");
+    }
+
+    // ---- for-each 遍历 ----
+
+    fn for_each_stmt(iterable: Expr, body: Stmt) -> Stmt {
+        Stmt::ForEachStmt(ForEachStmt {
+            variable: Expr::VariableDeclarationExpr(VarDeclStmt {
+                var_type: Some("String".to_string()),
+                declarations: vec![VarDeclarator {
+                    name: "s".to_string(),
+                    initializer: None,
+                }],
+                line: 2,
+            }),
+            iterable,
+            body: Box::new(body),
+            line: 2,
+        })
+    }
+
+    #[test]
+    fn for_each_break_does_not_exit_outer_loop() {
+        // while (true) { for (String s : list) { break; } } —— break 只退出 for-each
+        let fe = for_each_stmt(name("list"), Stmt::BreakStmt(BreakStmt { label: None, line: 3 }));
+        let unit = unit_with(vec![while_true(body_with(vec![fe]))]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 1, "for-each 内的 break 不退出外层 while(true)，外层仍应报死循环");
+    }
+
+    #[test]
+    fn for_each_return_exits_outer_loop() {
+        // while (true) { for (String s : list) { return; } } —— return 退出整个方法
+        let fe = for_each_stmt(name("list"), Stmt::ReturnStmt(ReturnStmt { expr: None, line: 3 }));
+        let unit = unit_with(vec![while_true(body_with(vec![fe]))]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 0, "for-each 内的 return 会退出外层 while(true)，不应报死循环");
+    }
+
+    #[test]
+    fn for_each_body_loops_are_checked() {
+        // for (String s : list) { while (true) {} } —— 体内死循环应被检出
+        let inner = Stmt::WhileStmt(WhileStmt {
+            condition: true_expr(),
+            body: Box::new(empty_block()),
+            line: 3,
+        });
+        let fe = for_each_stmt(name("list"), body_with(vec![inner]));
+        let unit = unit_with(vec![fe]);
+        let vs = InfiniteLoopRule::new().check_unit(&unit);
+        assert_eq!(vs.len(), 1, "for-each 体内的 while(true) 应被检出");
+        assert_eq!(vs[0].line, 3);
     }
 
     #[test]

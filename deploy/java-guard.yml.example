@@ -1,0 +1,23 @@
+# JavaGuard 配置文件示例
+# 放置在项目根目录下命名为 java-guard.yml，或通过 --config 指定路径
+
+# 规则配置
+rules:
+  # 最低严重级别：critical / major / minor / info
+  min_severity: info
+  
+  # 启用的规则（逗号分隔的 ID 列表，支持前缀通配如 J0*）
+  # 不指定则启用全部
+  # enable:
+  #   - J001
+  #   - J008
+  #   - J009
+  
+  # 禁用的规则
+  # disable:
+  #   - J003
+  
+  # 规则参数（传递给 Rhai 脚本的 config map）
+  params:
+    J006:
+      max_lines: 50

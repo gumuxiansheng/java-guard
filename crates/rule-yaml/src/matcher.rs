@@ -165,7 +165,14 @@ fn walk_stmt_for_method_call(
             if let Some(cond) = &fs.condition {
                 walk_expr_for_method_call(cond, pattern, file, rule_id, severity, message, out);
             }
+            for u in &fs.update {
+                walk_expr_for_method_call(u, pattern, file, rule_id, severity, message, out);
+            }
             walk_stmt_for_method_call(&fs.body, pattern, file, rule_id, severity, message, out);
+        }
+        Stmt::ForEachStmt(fe) => {
+            walk_expr_for_method_call(&fe.iterable, pattern, file, rule_id, severity, message, out);
+            walk_stmt_for_method_call(&fe.body, pattern, file, rule_id, severity, message, out);
         }
         Stmt::WhileStmt(ws) => {
             walk_expr_for_method_call(&ws.condition, pattern, file, rule_id, severity, message, out);
@@ -260,6 +267,14 @@ fn walk_expr_for_method_call(
         }
         Expr::EnclosedExpr(inner) => {
             walk_expr_for_method_call(inner, pattern, file, rule_id, severity, message, out);
+        }
+        Expr::VariableDeclarationExpr(vde) => {
+            // for 循环初始化中的声明（如 `for (int i = foo(); ...)`），初始化的调用也应检出
+            for d in &vde.declarations {
+                if let Some(init) = &d.initializer {
+                    walk_expr_for_method_call(init, pattern, file, rule_id, severity, message, out);
+                }
+            }
         }
         Expr::ObjectCreationExpr(oc) => {
             for arg in &oc.arguments {
@@ -1253,5 +1268,170 @@ mod tests {
         assert_eq!(vs.len(), 1);
         assert_eq!(vs[0].line, 8);
         assert_eq!(vs[0].message, "bad class innerBad");
+    }
+
+    #[test]
+    fn match_method_call_in_foreach_body() {
+        // for (String s : list) { System.out.println(s); } —— for-each 体内调用应被检出
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "C".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::MethodDeclaration(MethodDecl {
+                    name: "m".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    return_type: None,
+                    parameters: vec![],
+                    body: Some(BlockStmt {
+                        statements: vec![Stmt::ForEachStmt(ForEachStmt {
+                            variable: Expr::VariableDeclarationExpr(VarDeclStmt {
+                                var_type: Some("String".to_string()),
+                                declarations: vec![VarDeclarator {
+                                    name: "s".to_string(),
+                                    initializer: None,
+                                }],
+                                line: 4,
+                            }),
+                            iterable: Expr::NameExpr(NameExpr {
+                                name: "list".to_string(),
+                                line: 4,
+                            }),
+                            body: Box::new(Stmt::ExpressionStmt(ExprStmt {
+                                expr: Expr::MethodCallExpr(MethodCallExpr {
+                                    callee: Some("System.out".to_string()),
+                                    method_name: "println".to_string(),
+                                    arguments: vec![],
+                                    line: 5,
+                                }),
+                                line: 5,
+                            })),
+                            line: 4,
+                        })],
+                        line: 3,
+                        end_line: 6,
+                    }),
+                    line: 3,
+                    end_line: 6,
+                })],
+                line: 1,
+                end_line: 8,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::MethodCall,
+            match_fields: [
+                ("callee".to_string(), MatchValue::Single("System.out".to_string())),
+                ("method".to_string(), MatchValue::Single("println".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J001", Severity::Minor, "call");
+        assert_eq!(vs.len(), 1, "for-each 体内的 println 应被检出");
+        assert_eq!(vs[0].line, 5);
+    }
+
+    #[test]
+    fn match_method_call_in_for_init_and_update() {
+        // for (int i = next(); i < n; i = advance()) { } —— 初始化/更新子句中的调用应被检出
+        let unit = CompilationUnit {
+            package: None,
+            imports: vec![],
+            types: vec![TypeDecl::ClassDeclaration(ClassDecl {
+                name: "C".to_string(),
+                modifiers: vec![],
+                annotations: vec![],
+                extends: None,
+                implements: vec![],
+                members: vec![MemberDecl::MethodDeclaration(MethodDecl {
+                    name: "m".to_string(),
+                    modifiers: vec![],
+                    annotations: vec![],
+                    return_type: None,
+                    parameters: vec![],
+                    body: Some(BlockStmt {
+                        statements: vec![Stmt::ForStmt(ForStmt {
+                            initialization: Some(Expr::VariableDeclarationExpr(VarDeclStmt {
+                                var_type: Some("int".to_string()),
+                                declarations: vec![VarDeclarator {
+                                    name: "i".to_string(),
+                                    initializer: Some(Expr::MethodCallExpr(MethodCallExpr {
+                                        callee: None,
+                                        method_name: "next".to_string(),
+                                        arguments: vec![],
+                                        line: 4,
+                                    })),
+                                }],
+                                line: 4,
+                            })),
+                            condition: Some(Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(Expr::NameExpr(NameExpr {
+                                    name: "i".to_string(),
+                                    line: 4,
+                                })),
+                                op: "<".to_string(),
+                                right: Box::new(Expr::NameExpr(NameExpr {
+                                    name: "n".to_string(),
+                                    line: 4,
+                                })),
+                                line: 4,
+                            })),
+                            update: vec![Expr::AssignExpr(AssignExpr {
+                                target: Box::new(Expr::NameExpr(NameExpr {
+                                    name: "i".to_string(),
+                                    line: 5,
+                                })),
+                                op: "=".to_string(),
+                                value: Box::new(Expr::MethodCallExpr(MethodCallExpr {
+                                    callee: None,
+                                    method_name: "advance".to_string(),
+                                    arguments: vec![],
+                                    line: 5,
+                                })),
+                                line: 5,
+                            })],
+                            body: Box::new(Stmt::BlockStmt(BlockStmt {
+                                statements: vec![],
+                                line: 5,
+                                end_line: 5,
+                            })),
+                            line: 4,
+                        })],
+                        line: 3,
+                        end_line: 6,
+                    }),
+                    line: 3,
+                    end_line: 6,
+                })],
+                line: 1,
+                end_line: 8,
+            })],
+            source_file: "T.java".to_string(),
+            source_lines: vec![],
+            raw_json: String::new(),
+        };
+        let pattern = Pattern {
+            kind: PatternKind::MethodCall,
+            match_fields: [(
+                "method".to_string(),
+                MatchValue::Any(vec!["next".to_string(), "advance".to_string()]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let vs = match_pattern(&pattern, &unit, "T.java", "J001", Severity::Minor, "call");
+        assert_eq!(vs.len(), 2, "for 初始化与更新子句中的调用都应检出, got: {vs:?}");
+        let mut lines: Vec<usize> = vs.iter().map(|v| v.line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec![4, 5]);
     }
 }
