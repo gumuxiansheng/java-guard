@@ -1,9 +1,0 @@
-id: J003
-title: "import 不使用通配符"
-severity: minor
-category: code-smell
-pattern:
-  type: Import
-  match_fields:
-    is_wildcard: "true"
-message: "禁止使用通配符 import，应明确导入具体类"

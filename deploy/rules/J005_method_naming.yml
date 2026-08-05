@@ -1,9 +1,0 @@
-id: J005
-title: "方法名使用 camelCase"
-severity: minor
-category: style
-pattern:
-  type: MethodDeclaration
-  match_fields:
-    name: "^[A-Z]"
-message: "方法名应使用 camelCase（小写驼峰命名）"

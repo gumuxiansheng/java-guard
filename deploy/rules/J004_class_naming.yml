@@ -1,9 +1,0 @@
-id: J004
-title: "类名使用 PascalCase"
-severity: minor
-category: style
-pattern:
-  type: ClassDeclaration
-  match_fields:
-    name: "^[a-z]"
-message: "类名应使用 PascalCase（大写驼峰命名）"

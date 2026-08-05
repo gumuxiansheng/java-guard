@@ -8,3 +8,6 @@
 
 /target-test/
 .workbuddy/
+
+# 部署产物（误提交，不应进版本库）
+/deploy/
