@@ -93,6 +93,10 @@ enum Command {
         /// 配置文件路径（默认 java-guard.yml）
         #[clap(long, default_value = "java-guard.yml")]
         config: String,
+
+        /// 源文件编码（auto/utf-8/gbk/shift-jis/latin1 等，默认 auto 自动探测）
+        #[clap(long, default_value = "auto")]
+        encoding: String,
     },
     /// 列出可用规则
     Rules,
@@ -106,14 +110,14 @@ fn main() {
     match cli.command {
         Command::Scan {
             path, format, output, exclude, include, rules_dir, diff, baseline, gate, gate_config,
-            enable, disable, min_severity, parser_jar, java_cmd, config,
+            enable, disable, min_severity, parser_jar, java_cmd, config, encoding,
         } => {
             if let Err(e) = run_scan(
                 &path, &format, output.as_deref(), exclude.as_deref(), include.as_deref(),
                 rules_dir.as_deref(), diff.as_deref(), baseline.as_deref(),
                 gate, gate_config.as_deref(),
                 enable.as_deref(), disable.as_deref(), &min_severity,
-                parser_jar.as_deref(), java_cmd.as_deref(), config.as_str(),
+                parser_jar.as_deref(), java_cmd.as_deref(), config.as_str(), encoding.as_str(),
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(2);
@@ -187,6 +191,68 @@ struct FileCheck {
     error_msg: Option<String>,
 }
 
+/// 编码探测：读取文件字节并按指定编码解码为 UTF-8 字符串。
+///
+/// 支持的编码：
+/// - `auto`：自动探测（BOM → UTF-8 尝试 → GBK fallback）
+/// - `utf-8` / `utf8`：UTF-8
+/// - `gbk` / `gb2312` / `gb18030`：中文编码
+/// - `shift-jis` / `shift_jis` / `sjis`：日文编码
+/// - `latin1` / `iso-8859-1`：西欧编码
+/// - 其他 encoding_rs 支持的编码名称
+fn read_source_file(path: &Path, encoding: &str) -> Result<String, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+
+    let enc = encoding.to_ascii_lowercase();
+
+    if enc == "auto" {
+        // 1. BOM 探测
+        if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+            return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
+        }
+        // 2. 尝试 UTF-8
+        match std::str::from_utf8(&bytes) {
+            Ok(s) => return Ok(s.to_string()),
+            Err(_) => {}
+        }
+        // 3. fallback 到 GBK（中文项目最常见）
+        let (cow, _, had_errors) = encoding_rs::GBK.decode(&bytes);
+        if had_errors {
+            // GBK 也有问题，尝试 Shift-JIS，最后 Latin1（Latin1 不会失败）
+            let (cow2, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
+            if cow2.is_empty() || cow2.chars().any(|c| c == '\u{FFFD}') {
+                let (cow3, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
+                return Ok(cow3.into_owned());
+            }
+            return Ok(cow2.into_owned());
+        }
+        return Ok(cow.into_owned());
+    }
+
+    // 指定编码
+    let decoder = match enc.as_str() {
+        "utf-8" | "utf8" => encoding_rs::UTF_8,
+        "gbk" | "gb2312" => encoding_rs::GBK,
+        "gb18030" => encoding_rs::GB18030,
+        "shift-jis" | "shift_jis" | "sjis" => encoding_rs::SHIFT_JIS,
+        "latin1" | "iso-8859-1" | "iso8859-1" => encoding_rs::WINDOWS_1252,
+        "big5" => encoding_rs::BIG5,
+        "euc-kr" | "euc_kr" | "korean" => encoding_rs::EUC_KR,
+        _ => {
+            // 尝试用 encoding_rs 的名称查找
+            let (cow, _, _) = encoding_rs::Encoding::for_label(enc.as_bytes())
+                .unwrap_or(encoding_rs::UTF_8)
+                .decode(&bytes);
+            return Ok(cow.into_owned());
+        }
+    };
+    let (cow, _, _) = decoder.decode(&bytes);
+    Ok(cow.into_owned())
+}
+
 /// 解析单个文件并对所有启用的规则执行检查。
 ///
 /// 设计为线程安全，可在并行线程池中调用：`CliParser` 与 `Rule` 均为 `Sync`，
@@ -197,8 +263,9 @@ fn check_one_file(
     rule_list: &[Arc<dyn Rule<CompilationUnit>>],
     line_filter: &guard_core::git_diff::LineFilter,
     root: &Path,
+    encoding: &str,
 ) -> FileCheck {
-    let source = match std::fs::read_to_string(file) {
+    let source = match read_source_file(file, encoding) {
         Ok(s) => s,
         Err(e) => {
             return FileCheck {
@@ -267,6 +334,7 @@ fn run_scan(
     parser_jar: Option<&str>,
     java_cmd: Option<&str>,
     config_path: &str,
+    encoding: &str,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
 
@@ -274,6 +342,15 @@ fn run_scan(
     let project_config = load_project_config(config_path)?;
     let report_format = ReportFormat::from_str(format)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // 合并 encoding：CLI 参数优先于配置文件
+    let effective_encoding = if encoding != "auto" {
+        encoding
+    } else if let Some(ref enc) = project_config.scan.encoding {
+        enc.as_str()
+    } else {
+        "auto"
+    };
 
     // 合并配置文件和 CLI 参数（CLI 优先）
     let enable_str = enable.unwrap_or("");
@@ -446,10 +523,11 @@ fn run_scan(
                     let root = &scan_result.root;
                     let parsed = &parsed;
                     let parse_errors = &parse_errors;
+                    let encoding = effective_encoding;
                     s.spawn(move || {
                         for idx in (w..files.len()).step_by(n_workers) {
                             let check =
-                                check_one_file(&files[idx], parser, rule_list, line_filter, root);
+                                check_one_file(&files[idx], parser, rule_list, line_filter, root, encoding);
                             if check.parse_error {
                                 parse_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             } else {
@@ -647,6 +725,8 @@ struct ScanConfig {
     include: Vec<String>,
     /// 路径黑名单
     exclude: Vec<String>,
+    /// 源文件编码（auto/utf-8/gbk 等，默认 auto）
+    encoding: Option<String>,
 }
 
 /// 加载项目配置文件。文件不存在时返回默认值（不报错）。
@@ -773,5 +853,64 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(load_baseline(path.to_str().unwrap()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_source_file_utf8() {
+        let dir = std::env::temp_dir().join("javaguard_enc_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("utf8.java");
+        std::fs::write(&path, "class A {\n}").unwrap();
+        let s = read_source_file(&path, "auto").unwrap();
+        assert!(s.contains("class A"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_source_file_gbk() {
+        let dir = std::env::temp_dir().join("javaguard_enc_test2");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("gbk.java");
+        // GBK 编码的中文注释："// 测试中文"
+        let gbk_bytes = vec![0x2F, 0x2F, 0x20, 0xB2, 0xE2, 0xCA, 0xD4, 0xD6, 0xD0, 0xCE, 0xC4];
+        std::fs::write(&path, &gbk_bytes).unwrap();
+        let s = read_source_file(&path, "auto").unwrap();
+        assert!(s.contains("测试"), "auto-detect should decode GBK to readable Chinese, got: {s:?}");
+        // 显式指定 GBK
+        let s2 = read_source_file(&path, "gbk").unwrap();
+        assert!(s2.contains("测试"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_source_file_utf8_bom() {
+        let dir = std::env::temp_dir().join("javaguard_enc_test3");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bom.java");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+        bytes.extend_from_slice(b"class A {}");
+        std::fs::write(&path, &bytes).unwrap();
+        let s = read_source_file(&path, "auto").unwrap();
+        assert!(s.starts_with("class A"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_source_file_explicit_encoding() {
+        let dir = std::env::temp_dir().join("javaguard_enc_test4");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("shiftjis.java");
+        // Shift-JIS 编码的日文："// テスト"
+        let sjis_bytes = vec![0x2F, 0x2F, 0x20, 0x83, 0x65, 0x83, 0x58, 0x83, 0x67];
+        std::fs::write(&path, &sjis_bytes).unwrap();
+        let s = read_source_file(&path, "shift-jis").unwrap();
+        assert!(s.contains("テスト"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_source_file_missing_file_errors() {
+        let result = read_source_file(std::path::Path::new("/no/such/file.java"), "auto");
+        assert!(result.is_err());
     }
 }
