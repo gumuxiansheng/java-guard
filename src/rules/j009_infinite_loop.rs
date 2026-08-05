@@ -30,7 +30,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use guard_core::rule::{Rule, RuleId, Severity, Violation};
+use guard_core::rule::{Rule, RuleId, Severity, SpanPolicy, Violation};
 use java_ast::ast::*;
 
 pub struct InfiniteLoopRule {
@@ -62,6 +62,12 @@ impl Rule<CompilationUnit> for InfiniteLoopRule {
 
     fn severity(&self) -> Severity {
         Severity::Major
+    }
+
+    /// 死循环的「成因」可能位于循环体内任意位置（如删除更新表达式），
+    /// 增量扫描时按区间相交判定，避免漏报「锚点行未变、但体内变更引入死循环」。
+    fn span_policy(&self) -> SpanPolicy {
+        SpanPolicy::Intersect
     }
 
     fn check_unit(&self, unit: &CompilationUnit) -> Vec<Violation> {
@@ -517,16 +523,21 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
     }
     let invariant = cond_names.is_disjoint(&body_mut);
     let has_exit = loop_has_exit_stmt(body, 0, false);
+    // 循环区间结束行（供增量扫描 intersect 策略使用）；无块体时退化为锚点行判定
+    let end_line = match body {
+        Stmt::BlockStmt(b) => Some(b.end_line),
+        _ => None,
+    };
 
     // 1) 确定死循环：条件恒定真 + 条件变量在循环内不变 + 无退出
     if cond_val == Some(true) && invariant && !has_exit {
-        out.push(Violation::new(
-            "J009",
-            Severity::Major,
+        push_loop_violation(
+            out,
             file,
             line,
+            end_line,
             "循环条件在编译期即可确定为 true（字面量或常量传播），且条件所用变量在循环体内不被修改，且无 break/return/throw 退出：该循环将永不终止（死循环）",
-        ));
+        );
         return;
     }
     // 已存在退出路径则其余启发式不再适用
@@ -545,7 +556,7 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
             let msg = format!(
                 "for 循环缺少更新表达式（update），循环变量 [{vars}] 在条件中使用且条件涉及的所有变量在循环体内均未被修改，且无 break/return/throw 退出：计数器不会推进，可能死循环"
             );
-            out.push(Violation::new("J009", Severity::Major, file, line, &msg));
+            push_loop_violation(out, file, line, end_line, msg);
             return;
         }
     }
@@ -574,7 +585,7 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
             let msg = format!(
                 "for 循环的更新表达式对循环变量 [{vars}] 无实际效果（如 i = i / i = 0 / i += 0），条件永远不会因更新而变为 false，且无 break/return/throw 退出：可能死循环"
             );
-            out.push(Violation::new("J009", Severity::Major, file, line, &msg));
+            push_loop_violation(out, file, line, end_line, msg);
             return;
         }
     }
@@ -583,13 +594,7 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
     if is_for && !update.is_empty() {
         if let Some(cond_expr) = cond {
             if let Some(violation) = check_update_direction_conflict(cond_expr, update, &init_ints) {
-                out.push(Violation::new(
-                    "J009",
-                    Severity::Major,
-                    file,
-                    line,
-                    &violation,
-                ));
+                push_loop_violation(out, file, line, end_line, violation);
                 return;
             }
         }
@@ -606,10 +611,23 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
                 let msg = format!(
                     "while/do-while 的循环条件仅依赖变量 `{name}`，该变量在循环体内从未被修改且无 break/return/throw 退出：可能为事件循环误用或死循环（请确认存在外部修改或退出机制）"
                 );
-                out.push(Violation::new("J009", Severity::Major, file, line, &msg));
+                push_loop_violation(out, file, line, end_line, msg);
             }
         }
     }
+}
+
+/// 推送一条 J009 违规，附循环区间结束行（供增量扫描 intersect 策略使用）。
+fn push_loop_violation(
+    out: &mut Vec<Violation>,
+    file: &str,
+    line: usize,
+    end_line: Option<usize>,
+    msg: impl Into<String>,
+) {
+    let mut v = Violation::new("J009", Severity::Major, file, line, msg);
+    v.end_line = end_line;
+    out.push(v);
 }
 
 // ---------------------------------------------------------------------------

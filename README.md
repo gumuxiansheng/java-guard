@@ -57,6 +57,8 @@ java-guard rules
 | J005 | minor | YAML | 方法名使用 camelCase |
 | J006 | minor | Rhai | 方法不超过 50 行（可配置） |
 | J007 | minor | YAML | 常量使用 UPPER_SNAKE_CASE |
+| J010 | major | YAML | 禁止使用 fastjson，推荐使用 jackson |
+| J011 | minor | Rhai | StringUtils 应使用 org.apache.commons.lang3.StringUtils |
 | J008 | major | Rust | 空 catch 块 |
 | J009 | major | Rust | 潜在死循环检测 |
 
@@ -74,9 +76,31 @@ java-guard rules
 # git diff 模式：只扫描变更文件和行范围
 java-guard scan . --diff HEAD~1
 
-# baseline 模式：过滤已知违规
+# 语义对比模式：解析旧版本（git show）并做违规集合差，只报真正新增的违规
+java-guard scan . --diff HEAD~1 --semantic-diff
+
+# baseline 模式：过滤已知违规（行号漂移容差 5 行内视为同一违规）
 java-guard scan . --baseline baseline.json
+
+# 调整 baseline 匹配容差
+java-guard scan . --baseline baseline.json --baseline-tolerance 10
+
+# 导出当前违规为 baseline（供后续 --baseline 使用）
+java-guard scan . --baseline-out baseline.json
 ```
+
+增量过滤语义（规则级可配）：
+
+- `--diff` 模式：文件级（只解析变更文件）+ 行级（违规报告期过滤）两级过滤；**分析仍基于完整 AST**，不丢上下文
+- 行级过滤按规则的 `span_policy` 判定：
+  - `anchor`（默认）：锚点行落在变更行范围才报告，适合行级规则（System.out、空 catch）
+  - `intersect`：违规区间与变更行范围相交即报告，适合结构类规则（方法超长 J006、死循环 J009）
+- `--baseline` 模式：按 `(文件, 规则)` 分组做**距离容忍匹配**（行号差 ≤ 容差视为同一违规，1:1 分配），抗重构导致的行号漂移；容差可用 `--baseline-tolerance` 调整（默认 5）
+- `--semantic-diff`（语义对比模式，需配合 `--diff`）：解析旧版本源码（`git show <旧侧>:<路径>`）并与当前版本分别跑完整规则，按 `新违规 − 旧违规` 输出**集合差**：
+  - 旧违规行号经 **LineMapper**（基于 diff hunk 的新旧行号区间，插入/删除精确处理）翻译为新文件行号后做零容差匹配——循环体变更、方法重排导致的行号漂移不再误报「已知违规」为新增
+  - 被删除的行不参与匹配（代码已不存在，对应位置的新违规视为新增）
+  - 与 `--baseline` 配合时，baseline 行号同样经 LineMapper 精确翻译（替代容差匹配）；baseline 行号视为 diff 旧侧坐标（用 `--baseline-out` 在旧提交上生成）
+  - 已知限制：行号对应关系以 git 的 hunk 对齐为准；内容完全相同且重复出现的代码块可能被 git 对齐到新位置，导致匹配结果与代码意图存在偏差
 
 ### 报告格式
 
@@ -131,6 +155,7 @@ java-parser.jar (~1.8MB)
 id: NO_SYSTEM_OUT
 title: "禁止使用 System.out"
 severity: minor
+span_policy: anchor          # 可选：anchor（默认）/ intersect（结构类规则用）
 pattern:
   type: MethodCall
   match_fields:
@@ -172,7 +197,10 @@ Options:
   -I, --include <INCLUDE>   包含路径白名单（逗号分隔）
   -r, --rules-dir <DIR>     YAML 规则目录 [default: rules/]
       --diff <SPEC>         增量扫描：git diff 范围
+      --semantic-diff       语义对比模式：解析旧版本并做违规集合差（需 --diff）
+      --baseline-out <FILE> 导出当前违规为 baseline JSON
       --baseline <FILE>     Baseline 文件（只报告新增违规）
+      --baseline-tolerance <N>  Baseline 匹配容差：行号差 ≤ N 视为同一违规 [default: 5]
       --gate                CI gate 模式
       --gate-config <FILE>  Gate 配置文件
       --enable <IDS>        启用规则（逗号分隔）

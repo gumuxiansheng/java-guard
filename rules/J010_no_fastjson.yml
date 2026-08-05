@@ -1,0 +1,13 @@
+id: J010
+title: "禁止使用 fastjson / fastjson2，推荐使用 jackson"
+severity: major
+category: security
+pattern:
+  type: Import
+  match_fields:
+    # AstSerializer 将 import 的完整名称写入 package 字段，
+    # 例如 import com.alibaba.fastjson.JSON -> "com.alibaba.fastjson.JSON"
+    # glob 用 com.alibaba.fastjson* 同时覆盖经典 fastjson 1.x（com.alibaba.fastjson.*）
+    # 与 fastjson2（com.alibaba.fastjson2.*）两个包。
+    package: "com.alibaba.fastjson*"
+message: "禁止使用 fastjson / fastjson2（com.alibaba.fastjson*），存在反序列化安全漏洞（autotype RCE）风险，请改用 jackson（com.fasterxml.jackson）"

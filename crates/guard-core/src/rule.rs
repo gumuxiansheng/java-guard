@@ -73,6 +73,22 @@ impl FromStr for Severity {
 #[error("unknown severity: {0}")]
 pub struct SeverityParseError(String);
 
+/// 增量扫描（git diff）时违规的报告策略。
+///
+/// 决定违规在行级过滤时如何与变更行范围比较：
+/// - `anchor`（默认）：只有**锚点行** `violation.line` 落在变更行范围内才报告。
+///   适用于大多数行级规则（如禁止 System.out、空 catch）——违规的「成因」就在锚点行。
+/// - `intersect`：违规区间 `[line, end_line]` 与变更行范围相交即报告。
+///   适用于结构类规则（如方法超长、死循环）——违规的成因可能位于节点内任意位置，
+///   仅看锚点行会漏报「变更发生在节点内部」的新增违规。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SpanPolicy {
+    #[default]
+    Anchor,
+    Intersect,
+}
+
 /// 一条违规记录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Violation {
@@ -158,6 +174,14 @@ pub trait Rule<U>: Send + Sync {
 
     /// 检查编译单元，返回违规列表。
     fn check_unit(&self, unit: &U) -> Vec<Violation>;
+
+    /// 增量扫描时的报告策略（默认：仅按锚点行判定）。
+    ///
+    /// `anchor`：锚点行 `violation.line` 落在变更行范围才报告；
+    /// `intersect`：违规区间与变更行范围相交即报告（结构类规则覆盖）。
+    fn span_policy(&self) -> SpanPolicy {
+        SpanPolicy::Anchor
+    }
 }
 
 /// 违规收集器：聚合多条规则的违规结果。

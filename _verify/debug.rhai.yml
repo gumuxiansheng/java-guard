@@ -1,0 +1,26 @@
+id: J012
+title: "debug"
+severity: minor
+category: convention
+enabled: true
+script: |
+  let imported = [];
+  let imports = ast["imports"];
+  if imports != () {
+    for imp in imports {
+      let pkg = imp["package"];
+      let name = pkg;
+      if name.ends_with(".*") { name = name.sub_string(0, len(name) - 2); }
+      if name.starts_with("com.alibaba.fastjson") {
+        let parts = name.split('.');
+        let simple = parts[len(parts) - 1];
+        if simple != "fastjson" { imported.push(simple); }
+      }
+    }
+  }
+  let types = ast["types"];
+  let ntypes = 0;
+  if types != () { ntypes = len(types); }
+  let violations = [];
+  violations.push(#{ line: 1, message: "DEBUG imported=" + imported.to_string() + " ntypes=" + ntypes + " imports_raw=" + imports.to_string() });
+  violations

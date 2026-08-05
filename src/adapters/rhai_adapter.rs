@@ -37,6 +37,10 @@ impl Rule<CompilationUnit> for RhaiRuleAdapter {
         self.rule.enabled
     }
 
+    fn span_policy(&self) -> guard_core::rule::SpanPolicy {
+        self.rule.span_policy
+    }
+
     fn check_unit(&self, unit: &CompilationUnit) -> Vec<Violation> {
         let file = if unit.source_file.is_empty() {
             "<unknown>"
@@ -83,6 +87,7 @@ mod tests {
             category: "test".to_string(),
             enabled: true,
             params: serde_yaml::Value::Null,
+            span_policy: guard_core::rule::SpanPolicy::Anchor,
             script: script.to_string(),
         }
     }
@@ -94,6 +99,15 @@ mod tests {
         assert_eq!(adapter.description(), "Rhai 测试规则");
         assert_eq!(adapter.severity(), Severity::Minor);
         assert!(adapter.enabled());
+        assert_eq!(adapter.span_policy(), guard_core::rule::SpanPolicy::Anchor);
+    }
+
+    #[test]
+    fn adapter_exposes_span_policy_intersect() {
+        let mut rule = test_rule("[]");
+        rule.span_policy = guard_core::rule::SpanPolicy::Intersect;
+        let adapter = RhaiRuleAdapter::new(rule);
+        assert_eq!(adapter.span_policy(), guard_core::rule::SpanPolicy::Intersect);
     }
 
     #[test]

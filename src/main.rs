@@ -89,9 +89,21 @@ enum Command {
         #[clap(long)]
         diff: Option<String>,
 
+        /// 语义对比模式：解析旧版本文件（git show）并做违规集合差（需配合 --diff）
+        #[clap(long)]
+        semantic_diff: bool,
+
+        /// 把当前扫描结果导出为 baseline JSON 文件（供后续 --baseline 使用）
+        #[clap(long)]
+        baseline_out: Option<String>,
+
         /// Baseline JSON 文件：只报告 baseline 之外的新增违规
         #[clap(long)]
         baseline: Option<String>,
+
+        /// Baseline 匹配容差：同一 (文件, 规则) 的行号差不超过此值的违规视为已知违规（抗行号漂移）
+        #[clap(long, default_value = "5")]
+        baseline_tolerance: usize,
 
         /// CI gate 模式：违规超过阈值时退出码 1（配合 --gate-config）
         #[clap(long)]
@@ -140,12 +152,15 @@ fn main() {
 
     match cli.command {
         Command::Scan {
-            path, format, output, exclude, include, rules_dir, diff, baseline, gate, gate_config,
+            path, format, output, exclude, include, rules_dir, diff, semantic_diff, baseline_out,
+            baseline, baseline_tolerance,
+            gate, gate_config,
             enable, disable, min_severity, parser_jar, java_cmd, config, encoding,
         } => {
             if let Err(e) = run_scan(
                 &path, &format, output.as_deref(), exclude.as_deref(), include.as_deref(),
-                rules_dir.as_deref(), diff.as_deref(), baseline.as_deref(),
+                rules_dir.as_deref(), diff.as_deref(), semantic_diff, baseline_out.as_deref(),
+                baseline.as_deref(), baseline_tolerance,
                 gate, gate_config.as_deref(),
                 enable.as_deref(), disable.as_deref(), &min_severity,
                 parser_jar.as_deref(), java_cmd.as_deref(), config.as_str(), encoding.as_str(),
@@ -222,7 +237,7 @@ struct FileCheck {
     error_msg: Option<String>,
 }
 
-/// 编码探测：读取文件字节并按指定编码解码为 UTF-8 字符串。
+/// 编码探测：把原始字节按指定编码解码为 UTF-8 字符串（永不失败，回退链完备）。
 ///
 /// 支持的编码：
 /// - `auto`：自动探测（BOM → UTF-8 尝试 → GBK fallback）
@@ -231,36 +246,30 @@ struct FileCheck {
 /// - `shift-jis` / `shift_jis` / `sjis`：日文编码
 /// - `latin1` / `iso-8859-1`：西欧编码
 /// - 其他 encoding_rs 支持的编码名称
-fn read_source_file(path: &Path, encoding: &str) -> Result<String, String> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-
+fn decode_source_bytes(bytes: &[u8], encoding: &str) -> String {
     let enc = encoding.to_ascii_lowercase();
 
     if enc == "auto" {
         // 1. BOM 探测
         if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
-            return Ok(String::from_utf8_lossy(&bytes[3..]).into_owned());
+            return String::from_utf8_lossy(&bytes[3..]).into_owned();
         }
         // 2. 尝试 UTF-8
-        match std::str::from_utf8(&bytes) {
-            Ok(s) => return Ok(s.to_string()),
-            Err(_) => {}
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return s.to_string();
         }
         // 3. fallback 到 GBK（中文项目最常见）
-        let (cow, _, had_errors) = encoding_rs::GBK.decode(&bytes);
+        let (cow, _, had_errors) = encoding_rs::GBK.decode(bytes);
         if had_errors {
             // GBK 也有问题，尝试 Shift-JIS，最后 Latin1（Latin1 不会失败）
-            let (cow2, _, _) = encoding_rs::SHIFT_JIS.decode(&bytes);
+            let (cow2, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
             if cow2.is_empty() || cow2.chars().any(|c| c == '\u{FFFD}') {
-                let (cow3, _, _) = encoding_rs::WINDOWS_1252.decode(&bytes);
-                return Ok(cow3.into_owned());
+                let (cow3, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+                return cow3.into_owned();
             }
-            return Ok(cow2.into_owned());
+            return cow2.into_owned();
         }
-        return Ok(cow.into_owned());
+        return cow.into_owned();
     }
 
     // 指定编码
@@ -276,23 +285,104 @@ fn read_source_file(path: &Path, encoding: &str) -> Result<String, String> {
             // 尝试用 encoding_rs 的名称查找
             let (cow, _, _) = encoding_rs::Encoding::for_label(enc.as_bytes())
                 .unwrap_or(encoding_rs::UTF_8)
-                .decode(&bytes);
-            return Ok(cow.into_owned());
+                .decode(bytes);
+            return cow.into_owned();
         }
     };
-    let (cow, _, _) = decoder.decode(&bytes);
-    Ok(cow.into_owned())
+    let (cow, _, _) = decoder.decode(bytes);
+    cow.into_owned()
+}
+
+/// 读取文件字节并按指定编码解码（失败仅发生在读文件阶段）。
+fn read_source_file(path: &Path, encoding: &str) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(decode_source_bytes(&bytes, encoding))
+}
+
+/// 对所有启用的规则执行检查，返回原始违规列表（不过滤）。
+fn run_rules(unit: &CompilationUnit, rule_list: &[Arc<dyn Rule<CompilationUnit>>]) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for rule in rule_list {
+        if !rule.enabled() {
+            continue;
+        }
+        violations.extend(rule.check_unit(unit));
+    }
+    violations
+}
+
+/// 解析旧版本源码并收集违规（语义对比模式用）。
+///
+/// - 旧版本文件不存在（新增文件）→ 空列表
+/// - 旧版本解析失败 → 空列表 + stderr 警告（不影响新版本检查）
+fn collect_old_violations(
+    rel_path: &str,
+    old_ref: &str,
+    parser: &CliParser,
+    rule_list: &[Arc<dyn Rule<CompilationUnit>>],
+    root: &Path,
+    encoding: &str,
+) -> Vec<Violation> {
+    let bytes = match git_diff::read_old_source(root, Some(old_ref), rel_path) {
+        Ok(Some(b)) => b,
+        Ok(None) => return Vec::new(), // 新增文件：旧版本不存在
+        Err(e) => {
+            eprintln!("  warn: {e}");
+            return Vec::new();
+        }
+    };
+    let source = decode_source_bytes(&bytes, encoding);
+    match parser.parse(&source, rel_path) {
+        Ok(mut unit) => {
+            if unit.source_file.is_empty() {
+                unit.source_file = rel_path.to_string();
+            }
+            run_rules(&unit, rule_list)
+        }
+        Err(e) => {
+            eprintln!("  warn: old version parse error: {rel_path} — {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// 语义对比：新版本违规 − 旧版本违规。
+///
+/// 旧违规的行号先经 `mapper`（基于 diff hunk 的新旧行号区间）精确翻译为
+/// 新文件行号，再做集合差；被删除的行（翻译为 None）不参与匹配。
+fn semantic_difference(
+    new_violations: Vec<Violation>,
+    old_violations: Vec<Violation>,
+    mapper: &git_diff::LineMapper,
+) -> Vec<Violation> {
+    let mut known: std::collections::HashSet<(String, String, usize)> =
+        std::collections::HashSet::new();
+    for v in old_violations {
+        if let Some(new_line) = mapper.translate(&v.file, v.line) {
+            known.insert((v.file, v.rule_id.0, new_line));
+        }
+    }
+    new_violations
+        .into_iter()
+        .filter(|v| !known.contains(&(v.file.clone(), v.rule_id.0.clone(), v.line)))
+        .collect()
 }
 
 /// 解析单个文件并对所有启用的规则执行检查。
 ///
 /// 设计为线程安全，可在并行线程池中调用：`CliParser` 与 `Rule` 均为 `Sync`，
 /// 且 `CliParser::parse` 使用「进程 id + 调用序号」生成唯一临时文件，不会相互冲突。
+///
+/// `semantic_old_ref` 为 `Some` 时进入语义对比模式：解析旧版本（git show）并做
+/// 违规集合差；否则按 `line_filter` 做行级过滤（增量模式）。
+#[allow(clippy::too_many_arguments)]
 fn check_one_file(
     file: &Path,
     parser: &CliParser,
     rule_list: &[Arc<dyn Rule<CompilationUnit>>],
     line_filter: &guard_core::git_diff::LineFilter,
+    mapper: Option<&git_diff::LineMapper>,
+    semantic_old_ref: Option<&str>,
     root: &Path,
     encoding: &str,
 ) -> FileCheck {
@@ -318,20 +408,26 @@ fn check_one_file(
             if unit.source_file.is_empty() {
                 unit.source_file = rel_path.clone();
             }
-            let mut violations = Vec::new();
-            for rule in rule_list {
-                if !rule.enabled() {
-                    continue;
-                }
-                let vs = rule.check_unit(&unit);
-                let filtered: Vec<_> = if line_filter.is_incremental() {
-                    vs.into_iter()
-                        .filter(|v| line_filter.allows_range(&rel_path, v.line, v.end_line))
-                        .collect()
-                } else {
-                    vs
+            let mut violations = run_rules(&unit, rule_list);
+            if let Some(old_ref) = semantic_old_ref {
+                let old_violations = collect_old_violations(
+                    &rel_path,
+                    old_ref,
+                    parser,
+                    rule_list,
+                    root,
+                    encoding,
+                );
+                violations = match mapper {
+                    Some(m) => semantic_difference(violations, old_violations, m),
+                    None => violations,
                 };
-                violations.extend(filtered);
+            } else if line_filter.is_incremental() {
+                let lf = line_filter;
+                violations = violations
+                    .into_iter()
+                    .filter(|v| lf.allows_policy(&rel_path, v.line, v.end_line, rule_policy(v, rule_list)))
+                    .collect();
             }
             FileCheck {
                 violations,
@@ -347,6 +443,15 @@ fn check_one_file(
     }
 }
 
+/// 找到某违规所属规则的 span_policy（按 id 匹配；找不到时用默认 Anchor）。
+fn rule_policy(v: &Violation, rule_list: &[Arc<dyn Rule<CompilationUnit>>]) -> guard_core::rule::SpanPolicy {
+    rule_list
+        .iter()
+        .find(|r| r.id().0 == v.rule_id.0)
+        .map(|r| r.span_policy())
+        .unwrap_or(guard_core::rule::SpanPolicy::Anchor)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scan(
     path: &str,
@@ -356,7 +461,10 @@ fn run_scan(
     include: Option<&str>,
     rules_dir: Option<&str>,
     diff: Option<&str>,
+    semantic_diff: bool,
+    baseline_out: Option<&str>,
     baseline: Option<&str>,
+    baseline_tolerance: usize,
     gate: bool,
     gate_config: Option<&str>,
     enable: Option<&str>,
@@ -368,6 +476,10 @@ fn run_scan(
     encoding: &str,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
+
+    if semantic_diff && diff.is_none() {
+        return Err(anyhow::anyhow!("--semantic-diff requires --diff (e.g. --diff HEAD~1)"));
+    }
 
     // 加载配置文件（如果存在）
     let project_config = load_project_config(config_path)?;
@@ -485,6 +597,7 @@ fn run_scan(
     let scan_result = scanner::ScanResult { files: scan_files, root: scan_result.root };
 
     // M5: 增量扫描 — git diff 过滤
+    let mut line_mapper: Option<git_diff::LineMapper> = None;
     let line_filter = if let Some(diff_spec) = diff {
         match git_diff::get_diff(root, diff_spec) {
             Ok(diffs) => {
@@ -509,6 +622,7 @@ fn run_scan(
                     scan_result.files.len()
                 );
                 let lf = git_diff::LineFilter::from_diffs(&diffs);
+                line_mapper = Some(git_diff::LineMapper::from_diffs(&diffs));
                 // 返回过滤后的文件列表和行过滤器
                 (filtered, lf)
             }
@@ -519,6 +633,21 @@ fn run_scan(
         }
     } else {
         (scan_result.files.clone(), git_diff::LineFilter::all())
+    };
+
+    // 语义对比模式：解析 diff 规格的「旧侧」引用
+    let semantic_old_ref: Option<String> = if semantic_diff {
+        let spec = diff.expect("validated above: --semantic-diff requires --diff");
+        match resolve_old_ref(root, spec) {
+            Ok(old_ref) => Some(old_ref),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to resolve old ref for --semantic-diff (--diff {spec}): {e}"
+                ));
+            }
+        }
+    } else {
+        None
     };
 
     eprintln!(
@@ -551,14 +680,24 @@ fn run_scan(
                     let parser = &parser;
                     let rule_list = &rule_list;
                     let line_filter = &line_filter.1;
+                    let mapper = &line_mapper;
+                    let old_ref = &semantic_old_ref;
                     let root = &scan_result.root;
                     let parsed = &parsed;
                     let parse_errors = &parse_errors;
                     let encoding = effective_encoding;
                     s.spawn(move || {
                         for idx in (w..files.len()).step_by(n_workers) {
-                            let check =
-                                check_one_file(&files[idx], parser, rule_list, line_filter, root, encoding);
+                            let check = check_one_file(
+                                &files[idx],
+                                parser,
+                                rule_list,
+                                line_filter,
+                                mapper.as_ref(),
+                                old_ref.as_deref(),
+                                root,
+                                encoding,
+                            );
                             if check.parse_error {
                                 parse_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             } else {
@@ -591,21 +730,33 @@ fn run_scan(
     );
 
     // M5: Baseline 过滤
+    // - 语义对比模式（有 LineMapper）：用新旧行号映射把 baseline 精确翻译到新文件行号，零容差匹配
+    // - 普通模式：距离容忍匹配（同一 (文件, 规则) 行号差 ≤ tolerance 视为已知违规）
     let violations: Vec<_> = if let Some(baseline_path) = baseline {
         match load_baseline(baseline_path) {
-            Ok(baseline_set) => {
+            Ok(entries) => {
                 let before = collector.count();
-                let filtered: Vec<_> = collector
-                    .violations()
-                    .iter()
-                    .filter(|v| !baseline_set.contains(&(v.file.clone(), v.line, v.rule_id.to_string())))
-                    .cloned()
-                    .collect();
-                eprintln!(
-                    "Baseline: {} of {} violations are new",
-                    filtered.len(),
-                    before
-                );
+                let filtered = if let Some(mapper) = &line_mapper {
+                    let f = filter_baseline_mapped(collector.violations().to_vec(), &entries, mapper);
+                    eprintln!(
+                        "Baseline: {} of {} violations are new (mapped by diff hunks)",
+                        f.len(),
+                        before
+                    );
+                    f
+                } else {
+                    let f = filter_baseline(
+                        collector.violations().to_vec(),
+                        &entries,
+                        baseline_tolerance,
+                    );
+                    eprintln!(
+                        "Baseline: {} of {} violations are new (tolerance: {baseline_tolerance} lines)",
+                        f.len(),
+                        before
+                    );
+                    f
+                };
                 filtered
             }
             Err(e) => {
@@ -624,6 +775,11 @@ fn run_scan(
             .then(a.line.cmp(&b.line))
             .then(a.rule_id.cmp(&b.rule_id))
     });
+
+    // M5: 导出 baseline（快照当前全部违规，供后续 --baseline 使用）
+    if let Some(out_path) = baseline_out {
+        write_baseline(out_path, &violations)?;
+    }
 
     // 输出报告
     match output {
@@ -681,20 +837,113 @@ fn run_scan(
 }
 
 /// 加载 baseline 文件（JSON 格式，包含已知的违规列表）。
-fn load_baseline(path: &str) -> anyhow::Result<std::collections::HashSet<(String, usize, String)>> {
+///
+/// 条目形如 `{"file": "A.java", "line": 10, "rule_id": "J001"}`。
+fn load_baseline(path: &str) -> anyhow::Result<Vec<(String, usize, String)>> {
     let content = std::fs::read_to_string(path)?;
     let baseline: Vec<serde_json::Value> = serde_json::from_str(&content)
         .map_err(|e| anyhow::anyhow!("parse baseline JSON: {e}"))?;
 
-    let mut set = std::collections::HashSet::new();
+    let mut list = Vec::with_capacity(baseline.len());
     for v in &baseline {
         let file = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
         let line = v.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
         let rule_id = v.get("rule_id").and_then(|r| r.as_str()).unwrap_or("");
-        set.insert((file.to_string(), line, rule_id.to_string()));
+        list.push((file.to_string(), line, rule_id.to_string()));
     }
 
-    Ok(set)
+    Ok(list)
+}
+
+/// 把当前违规列表写为 baseline JSON（与 `load_baseline` 格式兼容）。
+fn write_baseline(path: &str, violations: &[Violation]) -> anyhow::Result<()> {
+    let list: Vec<serde_json::Value> = violations
+        .iter()
+        .map(|v| serde_json::json!({"file": v.file, "line": v.line, "rule_id": v.rule_id.0}))
+        .collect();
+    let json = serde_json::to_string_pretty(&list)?;
+    std::fs::write(path, json)?;
+    eprintln!("Baseline written to {path} ({} entries)", violations.len());
+    Ok(())
+}
+
+/// 解析 git diff 规格的「旧侧」引用（--semantic-diff 用）。
+///
+/// - `A...B`：旧侧 = merge-base(A, B)（与 `git diff A...B` 语义一致）
+/// - `A..B`：旧侧 = A
+/// - `X`（单个引用）：旧侧 = X
+fn resolve_old_ref(repo_root: &Path, diff_spec: &str) -> anyhow::Result<String> {
+    if let Some((a, b)) = diff_spec.split_once("...") {
+        let out = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge-base", a, b])
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run git merge-base {a} {b}: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!("git merge-base {a} {b} failed (no common ancestor?)"));
+        }
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    if let Some((a, _)) = diff_spec.split_once("..") {
+        return Ok(a.to_string());
+    }
+    Ok(diff_spec.to_string())
+}
+
+/// Baseline 精确过滤（语义对比模式）：用 LineMapper 把 baseline 行号精确翻译为
+/// 新文件行号后做零容差匹配；被删除的行（翻译为 None）不参与匹配。
+fn filter_baseline_mapped(
+    violations: Vec<Violation>,
+    baseline: &[(String, usize, String)],
+    mapper: &git_diff::LineMapper,
+) -> Vec<Violation> {
+    let mut known: std::collections::HashSet<(String, usize, String)> =
+        std::collections::HashSet::new();
+    for (bf, bl, br) in baseline {
+        if let Some(nl) = mapper.translate(bf, *bl) {
+            known.insert((bf.clone(), nl, br.clone()));
+        }
+    }
+    violations
+        .into_iter()
+        .filter(|v| !known.contains(&(v.file.clone(), v.line, v.rule_id.0.clone())))
+        .collect()
+}
+
+/// Baseline 距离容忍过滤：只保留 baseline 之外的「新增违规」。
+///
+/// 匹配规则：
+/// - 按 `(file, rule_id)` 分组匹配（不跨文件、不跨规则）；
+/// - 行号差 ≤ `tolerance` 的最近未匹配 baseline 条目视为同一违规（抗行号漂移）；
+/// - 每个 baseline 条目最多吸收一个违规（1:1 分配），避免单个条目误吞多个新增。
+fn filter_baseline(
+    violations: Vec<Violation>,
+    baseline: &[(String, usize, String)],
+    tolerance: usize,
+) -> Vec<Violation> {
+    let mut used = vec![false; baseline.len()];
+    violations
+        .into_iter()
+        .filter(|v| {
+            let mut best: Option<(u64, usize)> = None; // (行号差, baseline 索引)
+            for (i, (bf, bl, br)) in baseline.iter().enumerate() {
+                if used[i] || *bf != v.file || *br != v.rule_id.0 {
+                    continue;
+                }
+                let dist = (*bl as i64 - v.line as i64).unsigned_abs();
+                if dist <= tolerance as u64 && best.map_or(true, |(d, _)| dist < d) {
+                    best = Some((dist, i));
+                }
+            }
+            match best {
+                Some((_, i)) => {
+                    used[i] = true;
+                    false // 命中 baseline → 已知违规，过滤
+                }
+                None => true, // 未命中 → 新增违规，保留
+            }
+        })
+        .collect()
 }
 
 /// 查找 java-parser.jar。
@@ -776,6 +1025,7 @@ fn load_project_config(path: &str) -> anyhow::Result<ProjectConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guard_core::rule::Severity;
 
     #[test]
     fn cli_parse_scan_defaults() {
@@ -870,10 +1120,63 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("baseline.json");
         std::fs::write(&path, r#"[{"file":"A.java","line":10,"rule_id":"J001"}]"#).unwrap();
-        let set = load_baseline(path.to_str().unwrap()).unwrap();
-        assert!(set.contains(&("A.java".to_string(), 10, "J001".to_string())));
-        assert!(!set.contains(&("A.java".to_string(), 11, "J001".to_string())));
+        let entries = load_baseline(path.to_str().unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains(&("A.java".to_string(), 10, "J001".to_string())));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn baseline_matches_exact_line() {
+        let baseline = vec![("A.java".to_string(), 10, "J001".to_string())];
+        let vs = vec![Violation::new("J001", Severity::Minor, "A.java", 10, "x")];
+        assert!(filter_baseline(vs, &baseline, 5).is_empty());
+    }
+
+    #[test]
+    fn baseline_tolerates_line_drift() {
+        let baseline = vec![("A.java".to_string(), 10, "J001".to_string())];
+        // 上面插入 2 行 → 行号漂移到 12，容差内视为已知
+        let vs = vec![Violation::new("J001", Severity::Minor, "A.java", 12, "x")];
+        assert!(filter_baseline(vs, &baseline, 5).is_empty());
+        // 漂移 6 行超出容差 → 视为新增
+        let vs2 = vec![Violation::new("J001", Severity::Minor, "A.java", 16, "x")];
+        assert_eq!(filter_baseline(vs2, &baseline, 5).len(), 1);
+        // 容差为 0 退化为精确行号匹配
+        let vs3 = vec![Violation::new("J001", Severity::Minor, "A.java", 11, "x")];
+        assert_eq!(filter_baseline(vs3, &baseline, 0).len(), 1);
+    }
+
+    #[test]
+    fn baseline_requires_same_file_and_rule() {
+        let baseline = vec![("A.java".to_string(), 10, "J001".to_string())];
+        // 文件不同 / 规则不同 → 都不匹配
+        let vs = vec![
+            Violation::new("J001", Severity::Minor, "B.java", 10, "x"),
+            Violation::new("J003", Severity::Minor, "A.java", 10, "x"),
+        ];
+        assert_eq!(filter_baseline(vs, &baseline, 5).len(), 2);
+    }
+
+    #[test]
+    fn baseline_one_to_one_matching() {
+        // 两条 baseline 各吸收一个相邻违规 → 全过滤
+        let baseline = vec![
+            ("A.java".to_string(), 10, "J001".to_string()),
+            ("A.java".to_string(), 13, "J001".to_string()),
+        ];
+        let vs = vec![
+            Violation::new("J001", Severity::Minor, "A.java", 11, "x"),
+            Violation::new("J001", Severity::Minor, "A.java", 12, "x"),
+        ];
+        assert!(filter_baseline(vs, &baseline, 5).is_empty());
+        // 只有一条 baseline：最近的违规被吸收，另一个仍是新增
+        let baseline1 = vec![("A.java".to_string(), 10, "J001".to_string())];
+        let vs2 = vec![
+            Violation::new("J001", Severity::Minor, "A.java", 11, "x"),
+            Violation::new("J001", Severity::Minor, "A.java", 12, "x"),
+        ];
+        assert_eq!(filter_baseline(vs2, &baseline1, 5).len(), 1);
     }
 
     #[test]
@@ -943,5 +1246,119 @@ mod tests {
     fn read_source_file_missing_file_errors() {
         let result = read_source_file(std::path::Path::new("/no/such/file.java"), "auto");
         assert!(result.is_err());
+    }
+
+    fn mapper_with_hunks(hunks: Vec<git_diff::Hunk>) -> git_diff::LineMapper {
+        git_diff::LineMapper::from_diffs(&[git_diff::FileDiff {
+            path: "src/A.java".to_string(),
+            kind: git_diff::DiffKind::Modified,
+            line_ranges: vec![],
+            hunks,
+            is_new: false,
+        }])
+    }
+
+    #[test]
+    fn semantic_difference_removes_translated_lines() {
+        // 旧行 12 上方插入 3 行 → 旧违规 (12) 翻译为 15；新违规在 15 → 已知，过滤
+        let mapper = mapper_with_hunks(vec![git_diff::Hunk {
+            old_start: 5,
+            old_len: 0,
+            new_start: 8,
+            new_len: 3,
+        }]);
+        let old_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 12, "x")];
+        let new_vs = vec![
+            Violation::new("J001", Severity::Minor, "src/A.java", 15, "x"), // 已知
+            Violation::new("J001", Severity::Minor, "src/A.java", 30, "x"), // 新增
+        ];
+        let kept = semantic_difference(new_vs, old_vs, &mapper);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, 30);
+    }
+
+    #[test]
+    fn semantic_difference_keeps_new_violations() {
+        let mapper = mapper_with_hunks(vec![]);
+        let old_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 10, "x")];
+        let new_vs = vec![
+            Violation::new("J001", Severity::Minor, "src/A.java", 11, "x"), // 行号变了
+            Violation::new("J003", Severity::Minor, "src/A.java", 10, "x"), // 规则变了
+        ];
+        let kept = semantic_difference(new_vs, old_vs, &mapper);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn semantic_difference_deleted_lines_not_known() {
+        // 旧行 5-7 被删除；旧违规位于被删行 → 不参与匹配，新位置违规视为新增
+        let mapper = mapper_with_hunks(vec![git_diff::Hunk {
+            old_start: 5,
+            old_len: 3,
+            new_start: 5,
+            new_len: 0,
+        }]);
+        let old_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 6, "x")];
+        let new_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 5, "x")];
+        let kept = semantic_difference(new_vs, old_vs, &mapper);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn filter_baseline_mapped_translates_lines() {
+        // baseline 行 10 因上方插入 2 行翻译为 12；违规在 12 → 已知
+        let mapper = mapper_with_hunks(vec![git_diff::Hunk {
+            old_start: 3,
+            old_len: 0,
+            new_start: 5,
+            new_len: 2,
+        }]);
+        let baseline = vec![("src/A.java".to_string(), 10, "J001".to_string())];
+        let vs = vec![
+            Violation::new("J001", Severity::Minor, "src/A.java", 12, "x"),
+            Violation::new("J001", Severity::Minor, "src/A.java", 11, "x"),
+        ];
+        let kept = filter_baseline_mapped(vs, &baseline, &mapper);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, 11);
+    }
+
+    #[test]
+    fn filter_baseline_mapped_deleted_line_not_known() {
+        // baseline 位于被删除的行 → 不匹配，违规视为新增
+        let mapper = mapper_with_hunks(vec![git_diff::Hunk {
+            old_start: 10,
+            old_len: 2,
+            new_start: 10,
+            new_len: 0,
+        }]);
+        let baseline = vec![("src/A.java".to_string(), 11, "J001".to_string())];
+        let vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 11, "x")];
+        let kept = filter_baseline_mapped(vs, &baseline, &mapper);
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn resolve_old_ref_forms() {
+        assert_eq!(resolve_old_ref(std::path::Path::new("."), "HEAD~1").unwrap(), "HEAD~1");
+        assert_eq!(resolve_old_ref(std::path::Path::new("."), "main..feature").unwrap(), "main");
+        assert_eq!(resolve_old_ref(std::path::Path::new("."), "v1.0").unwrap(), "v1.0");
+    }
+
+    #[test]
+    fn write_baseline_roundtrip() {
+        let dir = std::env::temp_dir().join("javaguard_baseline_out_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("out.json");
+        let vs = vec![
+            Violation::new("J001", Severity::Minor, "A.java", 10, "x"),
+            Violation::new("J009", Severity::Major, "B.java", 3, "x"),
+        ];
+        write_baseline(path.to_str().unwrap(), &vs).unwrap();
+        let entries = load_baseline(path.to_str().unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&("A.java".to_string(), 10, "J001".to_string())));
+        assert!(entries.contains(&("B.java".to_string(), 3, "J009".to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

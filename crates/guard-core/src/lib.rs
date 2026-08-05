@@ -10,4 +10,4 @@ pub mod rule;
 pub use gate::{GateConfig, GateResult, SeverityCounts};
 pub use git_diff::{DiffKind, FileDiff, GitDiffError, LineFilter, LineRange};
 pub use reporter::{report, report_to, ConsoleReporter, CsvReporter, JsonReporter, ReportFormat, SarifReporter, ScanStats};
-pub use rule::{Rule, RuleId, Severity, Violation, ViolationCollector};
+pub use rule::{Rule, RuleId, Severity, SpanPolicy, Violation, ViolationCollector};

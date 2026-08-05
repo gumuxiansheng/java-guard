@@ -1,6 +1,6 @@
 //! YAML 规则定义与 Pattern 模型。
 
-use guard_core::rule::{RuleId, Severity};
+use guard_core::rule::{RuleId, Severity, SpanPolicy};
 use serde::{Deserialize, Serialize};
 
 /// 一条 YAML 声明式规则的完整定义。
@@ -25,6 +25,12 @@ pub struct YamlRule {
     /// 规则参数（如 max_lines 等，供 Rhai 规则用，YAML 规则不用）
     #[serde(default)]
     pub params: serde_yaml::Value,
+    /// 增量扫描时的报告策略：anchor（默认）/ intersect
+    ///
+    /// - `anchor`：锚点行落在 git diff 变更行范围才报告（默认，多数规则适用）
+    /// - `intersect`：违规区间与变更行范围相交即报告（结构类规则，如方法超长）
+    #[serde(default)]
+    pub span_policy: SpanPolicy,
 }
 
 fn default_true() -> bool {
@@ -164,6 +170,7 @@ message: "不要使用 System.out.println，请使用日志框架（SLF4J）"
         let rule: YamlRule = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rule.id, "J001");
         assert_eq!(rule.pattern.kind, PatternKind::MethodCall);
+        assert_eq!(rule.span_policy, SpanPolicy::Anchor);
         assert_eq!(
             rule.pattern.match_fields.get("callee").unwrap(),
             &MatchValue::Single("System.out".to_string())
@@ -205,5 +212,38 @@ message: "类名应使用 PascalCase"
 "#;
         let rule: YamlRule = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(rule.pattern.kind, PatternKind::ClassDeclaration);
+    }
+
+    #[test]
+    fn deserialize_span_policy_intersect() {
+        let yaml = r#"
+id: J006
+title: "方法超长"
+severity: minor
+span_policy: intersect
+pattern:
+  type: MethodDeclaration
+  match_fields:
+    name: ".*"
+message: "x"
+"#;
+        let rule: YamlRule = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rule.span_policy, SpanPolicy::Intersect);
+    }
+
+    #[test]
+    fn deserialize_unknown_span_policy_errors() {
+        let yaml = r#"
+id: J999
+title: "x"
+severity: minor
+span_policy: nope
+pattern:
+  type: MethodCall
+  match_fields:
+    method: "println"
+message: "x"
+"#;
+        assert!(serde_yaml::from_str::<YamlRule>(yaml).is_err());
     }
 }

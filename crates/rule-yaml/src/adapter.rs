@@ -36,6 +36,10 @@ impl Rule<CompilationUnit> for YamlRuleAdapter {
         self.rule.enabled
     }
 
+    fn span_policy(&self) -> guard_core::rule::SpanPolicy {
+        self.rule.span_policy
+    }
+
     fn check_unit(&self, unit: &CompilationUnit) -> Vec<Violation> {
         let file = if unit.source_file.is_empty() {
             "<unknown>"
@@ -120,6 +124,25 @@ message: "不要使用 System.out.println"
         assert_eq!(adapter.description(), "禁止 System.out.println");
         assert_eq!(adapter.severity(), Severity::Minor);
         assert!(adapter.enabled());
+        assert_eq!(adapter.span_policy(), guard_core::rule::SpanPolicy::Anchor);
+    }
+
+    #[test]
+    fn adapter_exposes_span_policy_intersect() {
+        let yaml = r#"
+id: J006
+title: "方法超长"
+severity: minor
+span_policy: intersect
+pattern:
+  type: MethodDeclaration
+  match_fields:
+    name: ".*"
+message: "x"
+"#;
+        let rule = load_rule_str(yaml).unwrap();
+        let adapter = YamlRuleAdapter::new(rule);
+        assert_eq!(adapter.span_policy(), guard_core::rule::SpanPolicy::Intersect);
     }
 
     #[test]

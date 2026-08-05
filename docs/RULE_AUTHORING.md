@@ -24,6 +24,8 @@ JavaGuard 支持三种规则来源，按复杂度递增：
 | J005 | YAML | 方法名应使用 camelCase |
 | J006 | Rhai | 方法体过长（默认 > 50 行） |
 | J007 | YAML | 常量（`static final` 字段）应使用 UPPER_SNAKE_CASE |
+| J010 | YAML | 禁止 `com.alibaba.fastjson.*`（fastjson），推荐 jackson |
+| J011 | Rhai | `StringUtils` / `StringUtil` 应使用 `org.apache.commons.lang3` 包，禁用其它包 |
 | J008 | Rust 内置 | 禁止空 catch 块 |
 
 ## YAML 声明式规则

@@ -32,8 +32,17 @@ impl RhaiRuleEngine {
     pub fn new() -> Self {
         let mut engine = Engine::new();
         // 设置合理的限制
-        engine.set_max_operations(1_000_000);
-        engine.set_max_call_levels(64);
+        // set_max_expr_depths(d, fd)：
+        //   - d：全局表达式深度（默认 release=64 / debug=32）
+        //   - fd：函数体内表达式深度（默认 release=32 / debug=16）★
+        // 规则脚本（如 J012 的递归 AST 遍历）函数体较深，会触发
+        // "Expression exceeds maximum complexity"。规则脚本是受信任的本地文件，
+        // 放宽到 256 足以覆盖复杂规则，同时仍保留解析上限防栈溢出。
+        engine.set_max_expr_depths(256, 256);
+        engine.set_max_operations(2_000_000);
+        // max_call_levels：递归遍历深度文件 AST 可能很深（数百层嵌套表达式），
+        // 放宽到 512 避免深文件假阳性「stack overflow」。
+        engine.set_max_call_levels(512);
         engine.set_max_string_size(1_000_000);
         engine.set_max_array_size(10_000);
         Self { engine }
@@ -266,6 +275,7 @@ mod tests {
             category: "code-smell".to_string(),
             enabled: true,
             params: serde_yaml::Value::Null,
+            span_policy: guard_core::rule::SpanPolicy::Anchor,
             script: r#"
                 let violations = [];
                 let types = ast.types;
@@ -303,6 +313,7 @@ mod tests {
             category: "test".to_string(),
             enabled: true,
             params: serde_yaml::Value::Null,
+            span_policy: guard_core::rule::SpanPolicy::Anchor,
             script: r#"
                 let violations = [];
                 let types = ast.types;
@@ -339,6 +350,7 @@ mod tests {
             category: "test".to_string(),
             enabled: true,
             params: serde_yaml::Value::Null,
+            span_policy: guard_core::rule::SpanPolicy::Anchor,
             script: "let x = ;".to_string(),
         };
 

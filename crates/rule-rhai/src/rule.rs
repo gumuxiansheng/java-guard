@@ -1,5 +1,6 @@
 //! Rhai 脚本规则定义与加载。
 
+use guard_core::rule::SpanPolicy;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -23,6 +24,9 @@ pub struct RhaiRule {
     /// 规则参数（注入到脚本的 config 变量）
     #[serde(default)]
     pub params: serde_yaml::Value,
+    /// 增量扫描时的报告策略：anchor（默认）/ intersect
+    #[serde(default)]
+    pub span_policy: SpanPolicy,
 }
 
 fn default_true() -> bool {
