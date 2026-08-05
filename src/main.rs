@@ -212,7 +212,7 @@ fn load_rhai_rules(dir: &Path) -> Result<Vec<RhaiRule>, Box<dyn std::error::Erro
         let path = entry?.path();
         if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext == "yml" || ext == "yaml" {
+            if ext == "yml" || ext == "yaml" || ext == "rhai" {
                 match rule_rhai::rule::load_rhai_rule_file(&path) {
                     Ok(r) => match r.validate() {
                         Ok(()) => rules.push(r),
