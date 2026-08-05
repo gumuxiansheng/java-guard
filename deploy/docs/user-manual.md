@@ -182,6 +182,10 @@ Options:
                                      [env: JAVAGUARD_PARSER_JAR]
       --java-cmd <JAVA_CMD>          Java 运行时路径 [env: JAVA_CMD]
       --config <CONFIG>              配置文件路径 [default: java-guard.yml]
+      --encoding <ENCODING>          源文件编码 [default: auto]
+                                     auto: 自动探测 (BOM→UTF-8→GBK→Shift-JIS→Latin1)
+                                     可选: utf-8, gbk, gb2312, gb18030,
+                                     shift-jis, big5, euc-kr, latin1 等
   -h, --help                         打印帮助
 ```
 
@@ -604,6 +608,35 @@ rules:
     - J001
     - J003
 ```
+
+### Q: 非 UTF-8 编码的 Java 文件能扫描吗
+
+可以。默认 `--encoding auto` 会自动探测文件编码：
+1. **BOM 探测**：UTF-8 BOM、UTF-16 BOM 等
+2. **UTF-8 尝试**：合法 UTF-8 直接使用
+3. **GBK fallback**：中文项目最常见
+4. **Shift-JIS fallback**：日文项目
+5. **Latin1 fallback**：不会失败
+
+也可显式指定编码：
+
+```bash
+java-guard scan . --encoding gbk
+java-guard scan . --encoding shift-jis
+java-guard scan . --encoding utf-8
+```
+
+支持常见编码：`utf-8`、`gbk`、`gb2312`、`gb18030`、`shift-jis`、`big5`、`euc-kr`、`latin1`，以及 `encoding_rs` crate 支持的其他编码名称。
+
+### Q: 如何在配置文件中指定编码
+
+```yaml
+# java-guard.yml
+scan:
+  encoding: gbk
+```
+
+CLI `--encoding` 参数优先于配置文件。
 
 ---
 

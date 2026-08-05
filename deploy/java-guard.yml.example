@@ -21,3 +21,16 @@ rules:
   params:
     J006:
       max_lines: 50
+
+# 扫描配置
+scan:
+  # 源文件编码：auto (自动探测) / utf-8 / gbk / shift-jis 等
+  # encoding: gbk
+  
+  # 路径白名单（只扫描匹配的路径）
+  # include:
+  #   - src/main
+  
+  # 路径黑名单（排除的目录）
+  # exclude:
+  #   - generated
