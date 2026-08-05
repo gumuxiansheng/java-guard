@@ -434,7 +434,18 @@ pub enum Expr {
     /// 复用 `VarDeclStmt` 结构承载 `var_type`/`declarations`/`line`。
     #[serde(rename = "VariableDeclarationExpr")]
     VariableDeclarationExpr(VarDeclStmt),
-    EnclosedExpr(Box<Expr>),
+    EnclosedExpr {
+        inner: Box<Expr>,
+        line: usize,
+    },
+    /// 未知表达式类型（Java 侧序列化器未覆盖的表达式）。
+    /// 降级为占位节点，保证单个文件解析失败不会中断整个扫描。
+    UnknownExpr {
+        #[serde(default)]
+        line: usize,
+        #[serde(default)]
+        value: String,
+    },
 }
 
 /// 方法调用。
@@ -775,6 +786,89 @@ mod tests {
         assert!(unit.imports[0].is_wildcard, "驼峰 isWildcard 应被识别");
         assert!(unit.imports[1].is_static, "驼峰 isStatic 应被识别");
         assert_eq!(unit.source_file, "Foo.java", "驼峰 sourceFile 应被识别");
+    }
+
+    /// 回归测试：Java 侧序列化器对未覆盖的表达式类型输出 `UnknownExpr` 兜底节点，
+    /// Rust 侧必须能反序列化，避免单个文件解析失败中断整个扫描。
+    #[test]
+    fn unknown_expr_fallback_deserializes() {
+        let v = json!({
+            "kind": "UnknownExpr",
+            "value": "SomeType.class",
+            "line": 10
+        });
+        let e: Expr = serde_json::from_value(v).unwrap();
+        match e {
+            Expr::UnknownExpr { line, value } => {
+                assert_eq!(line, 10);
+                assert_eq!(value, "SomeType.class");
+            }
+            _ => panic!("expected UnknownExpr"),
+        }
+    }
+
+    /// 回归测试：Java 侧 EnclosedExpr 输出 `{kind, inner, line}` 结构。
+    /// 早期 Rust 侧声明为新类型 `EnclosedExpr(Box<Expr>)`，反序列化时
+    /// 找不到 `kind` 字段而报 "missing field `kind`"，任何带括号表达式的
+    /// 文件都会解析失败。
+    #[test]
+    fn enclosed_expr_with_inner_and_line_deserializes() {
+        let v = json!({
+            "kind": "EnclosedExpr",
+            "inner": { "kind": "NameExpr", "name": "x", "line": 3 },
+            "line": 3
+        });
+        let e: Expr = serde_json::from_value(v).unwrap();
+        match e {
+            Expr::EnclosedExpr { inner, line } => {
+                assert_eq!(line, 3);
+                match inner.as_ref() {
+                    Expr::NameExpr(n) => assert_eq!(n.name, "x"),
+                    _ => panic!("expected inner NameExpr"),
+                }
+            }
+            _ => panic!("expected EnclosedExpr"),
+        }
+    }
+
+    /// 回归测试：ArrayCreationExpr（Java 侧早期漏序列化，落入 UnknownExpr）。
+    #[test]
+    fn array_creation_expr_deserializes() {
+        let v = json!({
+            "kind": "ArrayCreationExpr",
+            "element_type": "java.util.concurrent.Executor",
+            "initializer": [
+                { "kind": "NameExpr", "name": "taskExecutor", "line": 5 }
+            ],
+            "line": 5
+        });
+        let e: Expr = serde_json::from_value(v).unwrap();
+        match e {
+            Expr::ArrayCreationExpr(ac) => {
+                assert_eq!(ac.element_type, "java.util.concurrent.Executor");
+                assert_eq!(ac.initializer.len(), 1);
+            }
+            _ => panic!("expected ArrayCreationExpr"),
+        }
+    }
+
+    /// 回归测试：MethodReferenceExpr（Java 侧早期漏序列化，落入 UnknownExpr）。
+    #[test]
+    fn method_reference_expr_deserializes() {
+        let v = json!({
+            "kind": "MethodReferenceExpr",
+            "target": "taskExecutor",
+            "method": "execute",
+            "line": 7
+        });
+        let e: Expr = serde_json::from_value(v).unwrap();
+        match e {
+            Expr::MethodReferenceExpr(mr) => {
+                assert_eq!(mr.target.as_deref(), Some("taskExecutor"));
+                assert_eq!(mr.method, "execute");
+            }
+            _ => panic!("expected MethodReferenceExpr"),
+        }
     }
 
     #[test]

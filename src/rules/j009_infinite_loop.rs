@@ -319,7 +319,7 @@ fn collect_facts_expr(e: &Expr, bools: &mut Vec<(String, bool)>, re: &mut HashSe
         }
         Expr::InstanceOfExpr(io) => collect_facts_expr(&io.expr, bools, re),
         Expr::LambdaExpr(le) => collect_facts_stmt(&le.body, bools, re),
-        Expr::EnclosedExpr(inner) => collect_facts_expr(inner, bools, re),
+        Expr::EnclosedExpr { inner, .. } => collect_facts_expr(inner, bools, re),
         _ => {}
     }
 }
@@ -465,12 +465,13 @@ fn visit_expr(expr: &Expr, file: &str, out: &mut Vec<Violation>) {
                 }
             }
         }
-        Expr::EnclosedExpr(inner) => visit_expr(inner, file, out),
+        Expr::EnclosedExpr { inner, .. } => visit_expr(inner, file, out),
         Expr::NameExpr(_)
         | Expr::LiteralExpr(_)
         | Expr::ThisExpr(_)
         | Expr::SuperExpr(_)
-        | Expr::MethodReferenceExpr(_) => {}
+        | Expr::MethodReferenceExpr(_)
+        | Expr::UnknownExpr { .. } => {}
     }
 }
 
@@ -648,7 +649,7 @@ fn eval_expr_bool(e: &Expr, ctx: &ConstCtx, init_ints: &HashMap<String, i64>) ->
                 None
             }
         }
-        Expr::EnclosedExpr(inner) => eval_expr_bool(inner, ctx, init_ints),
+        Expr::EnclosedExpr { inner, .. } => eval_expr_bool(inner, ctx, init_ints),
         Expr::UnaryExpr(u) if u.op == "!" => eval_expr_bool(&u.expr, ctx, init_ints).map(|b| !b),
         Expr::BinaryExpr(be) => match be.op.as_str() {
             "&&" => {
@@ -710,7 +711,7 @@ fn eval_int(e: &Expr, init_ints: &HashMap<String, i64>) -> Option<i64> {
     match e {
         Expr::LiteralExpr(l) => l.value.trim_end_matches(['L', 'l']).parse::<i64>().ok(),
         Expr::NameExpr(n) => init_ints.get(&n.name).copied(),
-        Expr::EnclosedExpr(inner) => eval_int(inner, init_ints),
+        Expr::EnclosedExpr { inner, .. } => eval_int(inner, init_ints),
         Expr::UnaryExpr(u) if u.op == "-" => eval_int(&u.expr, init_ints).map(|v| -v),
         Expr::BinaryExpr(be) => {
             let l = eval_int(&be.left, init_ints)?;
@@ -802,7 +803,7 @@ fn collect_names(e: &Expr, s: &mut HashSet<String>) {
                 }
             }
         }
-        Expr::EnclosedExpr(inner) => collect_names(inner, s),
+        Expr::EnclosedExpr { inner, .. } => collect_names(inner, s),
         _ => {}
     }
 }
@@ -1037,7 +1038,7 @@ fn collect_mutated_expr(e: &Expr, set: &mut HashSet<String>) {
                 }
             }
         }
-        Expr::EnclosedExpr(inner) => collect_mutated_expr(inner, set),
+        Expr::EnclosedExpr { inner, .. } => collect_mutated_expr(inner, set),
         _ => {}
     }
 }
@@ -1427,12 +1428,13 @@ fn loop_has_exit_expr(expr: &Expr, rel: usize, in_lambda: bool) -> bool {
             .declarations
             .iter()
             .any(|d| d.initializer.as_ref().map_or(false, |i| loop_has_exit_expr(i, rel, in_lambda))),
-        Expr::EnclosedExpr(inner) => loop_has_exit_expr(inner, rel, in_lambda),
+        Expr::EnclosedExpr { inner, .. } => loop_has_exit_expr(inner, rel, in_lambda),
         Expr::NameExpr(_)
         | Expr::LiteralExpr(_)
         | Expr::ThisExpr(_)
         | Expr::SuperExpr(_)
-        | Expr::MethodReferenceExpr(_) => false,
+        | Expr::MethodReferenceExpr(_)
+        | Expr::UnknownExpr { .. } => false,
     }
 }
 

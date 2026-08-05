@@ -265,7 +265,7 @@ fn walk_expr_for_method_call(
             walk_expr_for_method_call(&aa.array, pattern, file, rule_id, severity, message, out);
             walk_expr_for_method_call(&aa.index, pattern, file, rule_id, severity, message, out);
         }
-        Expr::EnclosedExpr(inner) => {
+        Expr::EnclosedExpr { inner, .. } => {
             walk_expr_for_method_call(inner, pattern, file, rule_id, severity, message, out);
         }
         Expr::VariableDeclarationExpr(vde) => {

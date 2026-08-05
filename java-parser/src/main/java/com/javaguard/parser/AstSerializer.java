@@ -486,6 +486,25 @@ public class AstSerializer {
             }
             map.put("declarations", decls);
             map.put("line", vde.getBegin().map(p -> p.line).orElse(0));
+        } else if (expr instanceof ArrayCreationExpr) {
+            ArrayCreationExpr ace = (ArrayCreationExpr) expr;
+            map.put("kind", "ArrayCreationExpr");
+            map.put("element_type", ace.getElementType().asString());
+            List<Map<String, Object>> init = new ArrayList<>();
+            if (ace.getInitializer().isPresent()) {
+                for (Expression v : ace.getInitializer().get().getValues()) {
+                    init.add(serializeExpr(v));
+                }
+            }
+            map.put("initializer", init);
+            map.put("line", ace.getBegin().map(p -> p.line).orElse(0));
+        } else if (expr instanceof MethodReferenceExpr) {
+            MethodReferenceExpr mre = (MethodReferenceExpr) expr;
+            map.put("kind", "MethodReferenceExpr");
+            Expression scope = mre.getScope();
+            map.put("target", scope == null ? null : exprToString(scope));
+            map.put("method", mre.getIdentifier());
+            map.put("line", mre.getBegin().map(p -> p.line).orElse(0));
         } else {
             map.put("kind", "UnknownExpr");
             map.put("value", expr.toString());
