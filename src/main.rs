@@ -20,7 +20,31 @@ use rule_rhai::rule::RhaiRule;
 use crate::adapters::RhaiRuleAdapter;
 
 #[derive(Parser)]
-#[clap(name = "java-guard", version, about = "Lightweight Java static analysis")]
+#[clap(
+    name = "java-guard",
+    version,
+    about = "Lightweight Java static analysis — lightweight, fast, zero-config",
+    long_about = "JavaGuard — 轻量级 Java 静态分析工具\n\
+\n\
+A lightweight static analysis tool for Java code quality and bug detection.\n\
+Built-in rules cover empty catch blocks (J008), infinite loops (J009), naming\n\
+conventions, wildcard imports, System.out usage, and more. Custom rules can\n\
+be written in YAML (declarative) or Rhai (scripted).\n\
+\n\
+Features:\n\
+  • 8+ built-in rules (Rust / YAML / Rhai)\n\
+  • Multi-encoding support (auto-detect BOM/UTF-8/GBK/Shift-JIS)\n\
+  • Incremental scan via git diff + baseline filtering\n\
+  • CI gate mode with severity thresholds\n\
+  • Console / JSON / SARIF / CSV report formats\n\
+\n\
+Quick start:\n\
+  java-guard scan .                   # Scan current directory\n\
+  java-guard scan src/main -f json    # JSON report for src/main\n\
+  java-guard scan . --gate            # CI gate mode (exit 1 on violations)\n\
+\n\
+Documentation: https://github.com/javaguard/java-guard\n",
+)]
 struct Cli {
     #[clap(subcommand)]
     command: Command,
@@ -28,79 +52,86 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// 扫描 Java 代码
+    /// 扫描 Java 代码，检测代码质量问题与潜在 bug
+    ///
+    /// 递归扫描指定路径下所有 .java 文件，使用内置规则和自定义规则
+    /// 进行静态分析，输出违规报告。支持增量扫描、CI gate、多种报告格式。
+    #[clap(
+        verbatim_doc_comment,
+        after_help = "Examples:\n  java-guard scan .                      # Scan current directory\n  java-guard scan src/main -f json -o report.json\n  java-guard scan . --diff HEAD~1         # Only scan changed files\n  java-guard scan . --gate --gate-config gate.yml\n  java-guard scan . --encoding gbk       # Specify source encoding\n  java-guard scan . --enable J008,J009 --disable J003\n"
+    )]
     Scan {
-        /// 扫描路径（文件或目录）
+        /// 扫描路径（文件或目录，默认当前目录）
         #[clap(default_value = ".")]
         path: String,
 
-        /// 报告格式：console / json / csv / sarif
+        /// 报告格式：console（终端彩色）/ json / csv / sarif（SARIF 2.1.0）
         #[clap(short = 'f', long, default_value = "console")]
         format: String,
 
-        /// 输出到文件（默认 stdout）
+        /// 输出到文件（不指定则输出到 stdout）
         #[clap(short = 'o', long)]
         output: Option<String>,
 
-        /// 排除的目录名（逗号分隔，默认 target,build,.git,node_modules）
+        /// 排除目录名（逗号分隔，默认 target,build,.git,node_modules）
         #[clap(short = 'x', long)]
         exclude: Option<String>,
 
-        /// 包含路径白名单（逗号分隔，如 src/main）
+        /// 路径白名单（逗号分隔，只扫描匹配路径，如 src/main,src/test）
         #[clap(short = 'I', long)]
         include: Option<String>,
 
-        /// YAML 规则目录（默认 rules/）
+        /// YAML/Rhai 规则目录（默认 rules/，其下 rhai/ 子目录放 Rhai 脚本）
         #[clap(short = 'r', long)]
         rules_dir: Option<String>,
 
-        /// 增量扫描：git diff 范围（如 HEAD~1 或 main...feature）
+        /// 增量扫描：只检查 git diff 变更的文件（如 HEAD~1 或 main...feature）
         #[clap(long)]
         diff: Option<String>,
 
-        /// Baseline 文件（只报告新增违规）
+        /// Baseline JSON 文件：只报告 baseline 之外的新增违规
         #[clap(long)]
         baseline: Option<String>,
 
-        /// CI gate 模式（违规超阈值时退出码 1）
+        /// CI gate 模式：违规超过阈值时退出码 1（配合 --gate-config）
         #[clap(long)]
         gate: bool,
 
-        /// Gate 配置文件（YAML）
+        /// Gate 配置文件（YAML，定义 max_critical/max_major/max_minor 阈值）
         #[clap(long)]
         gate_config: Option<String>,
 
-        /// 启用规则（逗号分隔，覆盖默认）
+        /// 只启用指定规则（逗号分隔 ID，如 J008,J009，覆盖默认全启用）
         #[clap(long)]
         enable: Option<String>,
 
-        /// 禁用规则（逗号分隔）
+        /// 禁用指定规则（逗号分隔 ID，如 J003）
         #[clap(long)]
         disable: Option<String>,
 
-        /// 最低严重级别
+        /// 最低严重级别：info / minor / major / critical（低于此级别的违规不报告）
         #[clap(long, default_value = "info")]
         min_severity: String,
 
-        /// java-parser.jar 路径
+        /// java-parser.jar 路径（不指定则自动查找）
         #[clap(long, env = "JAVAGUARD_PARSER_JAR")]
         parser_jar: Option<String>,
 
-        /// Java 运行时路径
+        /// Java 运行时路径（默认 java，可指向 jdk-17/bin/java）
         #[clap(long, env = "JAVA_CMD")]
         java_cmd: Option<String>,
 
-        /// 配置文件路径（默认 java-guard.yml）
+        /// 项目配置文件路径（YAML，含 rules/scan/gate 配置）
         #[clap(long, default_value = "java-guard.yml")]
         config: String,
 
-        /// 源文件编码（auto/utf-8/gbk/shift-jis/latin1 等，默认 auto 自动探测）
+        /// 源文件编码：auto（自动探测 BOM→UTF-8→GBK→Shift-JIS）/ utf-8 / gbk / shift-jis 等
         #[clap(long, default_value = "auto")]
         encoding: String,
     },
-    /// 列出可用规则
+    /// 列出所有可用规则（内置 + YAML + Rhai）
     Rules,
-    /// 显示版本信息
+    /// 显示版本信息和构建详情
     Version,
 }
 
