@@ -33,6 +33,15 @@ fn default_true() -> bool {
     true
 }
 
+/// 解析头部 `enabled` 值，兼容 YAML 布尔写法（大小写不敏感）。无法识别时返回 `None`。
+fn parse_bool_header(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RhaiRuleError {
     #[error("failed to parse rule YAML: {0}")]
@@ -69,8 +78,11 @@ pub fn load_rhai_rule_file(path: &std::path::Path) -> Result<RhaiRule, RhaiRuleE
 /// //! enabled: true
 /// //! params: max_lines=50,threshold=10
 /// ```
-/// 注释块之后为 Rhai 脚本正文。`rule` 和 `severity` 必填，其余可选。
+/// 注释块之后为 Rhai 脚本正文。`rule` 必填；`severity` 缺省为 `minor`，其余可选。
+/// `enabled` 支持 true/false/yes/no/on/off/1/0（大小写不敏感）。
 pub fn parse_rhai_script(content: &str) -> Result<RhaiRule, RhaiRuleError> {
+    // 去除 UTF-8 BOM（部分 Windows 编辑器默认写入）
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     let mut id = String::new();
     let mut title = String::new();
     let mut severity = "minor".to_string();
@@ -79,11 +91,13 @@ pub fn parse_rhai_script(content: &str) -> Result<RhaiRule, RhaiRuleError> {
     let mut params_str = String::new();
     let mut script_lines = Vec::new();
     let mut in_header = true;
+    let mut saw_meta = false;
 
     for line in content.lines() {
         if in_header {
             let trimmed = line.trim_start();
             if let Some(rest) = trimmed.strip_prefix("//!") {
+                saw_meta = true;
                 let rest = rest.trim();
                 if let Some((key, val)) = rest.split_once(':') {
                     let key = key.trim();
@@ -93,17 +107,24 @@ pub fn parse_rhai_script(content: &str) -> Result<RhaiRule, RhaiRuleError> {
                         "title" | "name" => title = val.to_string(),
                         "severity" => severity = val.to_string(),
                         "category" => category = val.to_string(),
-                        "enabled" => enabled = val == "true" || val == "yes" || val == "1",
+                        "enabled" => {
+                            enabled = parse_bool_header(val).ok_or_else(|| {
+                                RhaiRuleError::Compile(format!(
+                                    "invalid `enabled` value `{val}` in .rhai file header"
+                                ))
+                            })?;
+                        }
                         "params" => params_str = val.to_string(),
                         _ => {}
                     }
                 }
                 continue;
-            } else if trimmed.is_empty() || trimmed.starts_with("//") {
-                // 空行或普通注释仍在头部区域
+            } else if trimmed.is_empty() && !saw_meta {
+                // 首个元数据行之前的空行
                 continue;
             } else {
-                // 第一个非头部行，进入脚本正文
+                // 第一个非元数据行（空行、普通注释或正文）结束头部，
+                // 保证正文开头的 `//` 注释块原样保留
                 in_header = false;
                 script_lines.push(line.to_string());
             }
@@ -260,6 +281,53 @@ violations
             }
             _ => panic!("expected mapping"),
         }
+    }
+
+    #[test]
+    fn parse_rhai_script_enabled_case_insensitive() {
+        let script = "//! rule: J101\n//! enabled: True\nlet x = 1;";
+        let rule = parse_rhai_script(script).unwrap();
+        assert!(rule.enabled);
+
+        let script = "//! rule: J102\n//! enabled: OFF\nlet x = 1;";
+        let rule = parse_rhai_script(script).unwrap();
+        assert!(!rule.enabled);
+
+        let script = "//! rule: J103\n//! enabled: YES\nlet x = 1;";
+        let rule = parse_rhai_script(script).unwrap();
+        assert!(rule.enabled);
+    }
+
+    #[test]
+    fn parse_rhai_script_invalid_enabled_errors() {
+        let script = "//! rule: J104\n//! enabled: maybe\nlet x = 1;";
+        assert!(parse_rhai_script(script).is_err());
+    }
+
+    #[test]
+    fn parse_rhai_script_keeps_body_comments() {
+        let script = "\
+//! rule: J105
+//! title: 保留正文注释
+
+// 正文开头的注释块
+// 应当原样保留
+let x = 1;
+x
+";
+        let rule = parse_rhai_script(script).unwrap();
+        assert_eq!(rule.id, "J105");
+        assert!(rule.script.contains("// 正文开头的注释块"), "script: {}", rule.script);
+        assert!(rule.script.contains("// 应当原样保留"), "script: {}", rule.script);
+    }
+
+    #[test]
+    fn parse_rhai_script_strips_utf8_bom() {
+        let script = "\u{FEFF}//! rule: J106\n//! severity: major\nlet x = 1;";
+        let rule = parse_rhai_script(script).unwrap();
+        assert_eq!(rule.id, "J106");
+        assert_eq!(rule.severity, "major");
+        assert!(rule.script.contains("let x = 1;"));
     }
 
     #[test]
