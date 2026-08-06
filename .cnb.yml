@@ -18,7 +18,7 @@ $:
             - apt-get update && apt-get install -y default-jdk maven
         - name: build java-parser
           script:
-            - cd java-parser && mvn -B clean package -DskipTests
+            - (cd java-parser && mvn -B clean package -DskipTests)
             - mkdir -p ./dist
             - ls -la java-parser/target/*.jar
             - cp java-parser/target/java-parser.jar ./dist/java-parser.jar
