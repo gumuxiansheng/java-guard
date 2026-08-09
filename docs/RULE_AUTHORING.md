@@ -26,6 +26,7 @@ JavaGuard 支持三种规则来源，按复杂度递增：
 | J007 | YAML | 常量（`static final` 字段）应使用 UPPER_SNAKE_CASE |
 | J010 | YAML | 禁止 `com.alibaba.fastjson.*`（fastjson），推荐 jackson |
 | J011 | Rhai | `StringUtils` / `StringUtil` 应使用 `org.apache.commons.lang3` 包，禁用其它包 |
+| J013 | Rhai | Spring `@Controller` / `@RestController` 的 HTTP 接口方法禁止以 `Map` 作为入参，应使用明确的请求参数对象（DTO） |
 | J008 | Rust 内置 | 禁止空 catch 块 |
 
 ## YAML 声明式规则
