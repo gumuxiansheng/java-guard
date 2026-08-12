@@ -103,6 +103,8 @@ pub fn get_diff(repo_root: &Path, spec: &str) -> Result<Vec<FileDiff>, GitDiffEr
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    
     Ok(parse_diff(&stdout))
 }
 
@@ -247,6 +249,10 @@ pub fn find_git_root(start: &Path) -> Result<PathBuf, GitDiffError> {
     let mut current = start.to_path_buf();
     loop {
         if current.join(".git").exists() {
+            // 空路径表示当前工作目录即 git root
+            if current.as_os_str().is_empty() {
+                return Ok(PathBuf::from("."));
+            }
             return Ok(current);
         }
         if !current.pop() {

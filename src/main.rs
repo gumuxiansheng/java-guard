@@ -600,9 +600,59 @@ fn run_scan(
     let mut line_mapper: Option<git_diff::LineMapper> = None;
     let line_filter = if let Some(diff_spec) = diff {
         match git_diff::get_diff(root, diff_spec) {
-            Ok(diffs) => {
+            Ok(mut diffs) => {
+                // git diff 返回的路径相对于 repo root，而 scan_result.root 是绝对路径。
+                // 找到 git root，把 diff path 转成绝对路径，统一基准。
+                let git_root = git_diff::find_git_root(root)
+                    .ok()
+                    .and_then(|p| {
+                        let canon = std::fs::canonicalize(&p).ok()?;
+                        let s = canon.to_string_lossy();
+                        let stripped = s.strip_prefix("\\\\?\\").unwrap_or(&s);
+                        Some(PathBuf::from(stripped))
+                    })
+                    .unwrap_or_else(|| root.to_path_buf());
+                let git_root_str = git_root.to_string_lossy().replace('\\', "/");
+                let git_root_prefix = if git_root_str.ends_with('/') {
+                    git_root_str.clone()
+                } else {
+                    format!("{}/", git_root_str)
+                };
+                let scan_root_str = scan_result.root.to_string_lossy().replace('\\', "/");
+                let scan_root_prefix = if scan_root_str.ends_with('/') {
+                    scan_root_str.clone()
+                } else {
+                    format!("{}/", scan_root_str)
+                };
+                // 将 diff 文件路径转为 scan-root-relative
+                for d in &mut diffs {
+                    let p = d.path.replace('\\', "/");
+                    // 先转成绝对路径
+                    let abs = if p.starts_with(&git_root_prefix) || p == git_root_str {
+                        p.clone()
+                    } else {
+                        format!("{}{}", git_root_prefix, p)
+                    };
+                    // 再转成 scan-root-relative
+                    d.path = if let Some(rel) = abs.strip_prefix(&scan_root_prefix) {
+                        rel.to_string()
+                    } else if abs == scan_root_str {
+                        String::new()
+                    } else {
+                        // 不在 scan root 下，保留绝对路径（会被文件过滤排除）
+                        abs
+                    };
+                }
+                
+                
+                
+                
+                
+                
+                
+                
                 let diff_files: std::collections::HashSet<String> =
-                    diffs.iter().map(|d| d.path.replace('\\', "/")).collect();
+                    diffs.iter().map(|d| d.path.clone()).collect();
                 let filtered: Vec<PathBuf> = scan_result
                     .files
                     .iter()
