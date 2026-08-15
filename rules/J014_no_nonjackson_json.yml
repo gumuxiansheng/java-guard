@@ -1,0 +1,22 @@
+id: J014
+title: "禁止引入非 jackson（com.fasterxml.jackson）的 JSON 框架"
+severity: major
+category: convention
+pattern:
+  type: Import
+  match_fields:
+    # 部门规范第 15 条：增量代码禁止使用除中台默认 jackson 之外的 JSON 框架。
+    # 本规则覆盖「除 fastjson 之外」的常见非 jackson JSON 框架；
+    # fastjson 由 J010（安全角度）专门负责，避免重复报告。
+    # 默认允许的 jackson 为 com.fasterxml.jackson.*（2.x），不在下列清单。
+    # 注：org.codehaus.jackson 为已废弃的 Jackson 1.x（区别于默认的 2.x），
+    #     按「统一使用默认 jackson 2.x」的口径一并拦截；若团队仍有受批准的 1.x 存量，
+    #     可删除该条 glob 或用 --baseline 抑制已知存量。
+    # 注：json-simple 库（com.googlecode.json-simple）的 Java 包名是 org.json.simple，
+    #     已被下方 "org.json*" 覆盖，无需单独列 glob。
+    package:
+      - "com.google.gson*"              # Gson
+      - "org.json*"                     # JSON-java（含 org.json.simple / json-simple）
+      - "net.sf.json*"                  # json-lib
+      - "org.codehaus.jackson*"         # Jackson 1.x（已废弃）
+message: "禁止使用非 jackson（com.fasterxml.jackson）的 JSON 框架（{package}），请统一使用部门默认的 jackson；如必须使用请走部门审核确认（存量应改尽改）"
