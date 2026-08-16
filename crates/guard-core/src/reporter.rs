@@ -46,19 +46,20 @@ impl std::str::FromStr for ReportFormat {
 mod color {
     pub const RED: &str = "\x1b[31m";
     pub const YELLOW: &str = "\x1b[33m";
-    pub const BLUE: &str = "\x1b[34m";
+    pub const CYAN: &str = "\x1b[36m";
     pub const GRAY: &str = "\x1b[90m";
     pub const GREEN: &str = "\x1b[32m";
     pub const BOLD: &str = "\x1b[1m";
     pub const RESET: &str = "\x1b[0m";
 }
 
-fn severity_color(s: Severity) -> &'static str {
+/// 严重级别 → 控制台标签（如 `[MAJOR]`）与颜色（与 sql-guard 的 ERROR/WARN 风格对齐）。
+fn severity_tag(s: Severity) -> (&'static str, &'static str) {
     match s {
-        Severity::Critical => color::RED,
-        Severity::Major => color::RED,
-        Severity::Minor => color::YELLOW,
-        Severity::Info => color::BLUE,
+        Severity::Critical => ("CRITICAL", color::RED),
+        Severity::Major => ("MAJOR", color::RED),
+        Severity::Minor => ("MINOR", color::YELLOW),
+        Severity::Info => ("INFO", color::CYAN),
     }
 }
 
@@ -103,8 +104,29 @@ impl ScanStats {
 
 // ─── Console Reporter ───────────────────────────────────────────
 
-/// 控制台 Reporter：彩色输出违规列表。
+/// 控制台 Reporter：sql-guard 同款版式输出违规报告。
+///
+/// ```text
+/// ════════════════════════════════════════════════════════════
+///  JavaGuard Report
+/// ════════════════════════════════════════════════════════════
+///
+/// Files checked: 1
+///
+/// ── Violations ──
+/// ────────────────────────────────────────
+///   [MAJOR] src/Foo.java:3 (rule: J010)
+///         禁止使用 fastjson ...
+///
+/// ────────────────────────────────────────
+/// Summary: 2 major(s)
+/// ```
 pub struct ConsoleReporter;
+
+/// 横幅宽度（═ 个数），与 sql-guard 一致。
+const BANNER_WIDTH: usize = 60;
+/// 分节分隔线宽度（─ 个数），与 sql-guard 一致。
+const SEP_WIDTH: usize = 40;
 
 impl ConsoleReporter {
     pub fn report(violations: &[Violation]) -> io::Result<()> {
@@ -114,76 +136,98 @@ impl ConsoleReporter {
     pub fn report_to<W: IoWrite>(
         w: &mut W,
         violations: &[Violation],
-        _files_scanned: usize,
-        _parse_errors: usize,
+        files_scanned: usize,
+        parse_errors: usize,
         _duration_ms: Option<u64>,
     ) -> io::Result<()> {
+        // ── Banner ──
+        writeln!(w, "{}{}{}", color::GRAY, "═".repeat(BANNER_WIDTH), color::RESET)?;
+        writeln!(w, "{} JavaGuard Report{}", color::BOLD, color::RESET)?;
+        writeln!(w, "{}{}{}", color::GRAY, "═".repeat(BANNER_WIDTH), color::RESET)?;
+        writeln!(w)?;
+        writeln!(w, "{}Files{} checked: {files_scanned}", color::BOLD, color::RESET)?;
+        writeln!(w)?;
+
         if violations.is_empty() {
-            writeln!(w, "{}No issues found.{}", color::GREEN, color::RESET)?;
-            return Ok(());
-        }
+            writeln!(w, "{}✓ No violations found{}", color::GREEN, color::RESET)?;
+            writeln!(w)?;
+            Self::write_summary(w, violations, parse_errors)
+        } else {
+            writeln!(w, "{}{}── Violations ──{}", color::RED, color::BOLD, color::RESET)?;
+            writeln!(w, "{}{}{}", color::GRAY, "─".repeat(SEP_WIDTH), color::RESET)?;
 
-        let mut by_file: std::collections::BTreeMap<&str, Vec<&Violation>> =
-            std::collections::BTreeMap::new();
-        for v in violations {
-            by_file.entry(v.file.as_str()).or_default().push(v);
-        }
+            // 按严重级别降序 + 文件路径/行号排序（与 sql-guard 一致：最严重的排最前）
+            let mut sorted = violations.to_vec();
+            sorted.sort_by(|a, b| {
+                b.severity
+                    .cmp(&a.severity)
+                    .then_with(|| a.file.cmp(&b.file))
+                    .then_with(|| a.line.cmp(&b.line))
+            });
 
-        for (file, vs) in &by_file {
-            writeln!(
-                w,
-                "\n{}{}{} ({} issue{})",
-                color::BOLD,
-                file,
-                color::RESET,
-                vs.len(),
-                if vs.len() > 1 { "s" } else { "" }
-            )?;
-
-            for v in vs {
-                let sev = severity_color(v.severity);
-                // 位置串：单行为 `8`，跨行为 `8-9`；冒号统一作为位置与级别的分隔符。
+            for v in &sorted {
+                let (tag, sev_color) = severity_tag(v.severity);
+                // 位置串：单行为 `:8`，跨行为 `:8-9`（与 sql-guard 的 file:line[-end] 对齐）
                 let loc = match v.end_line {
-                    Some(end) if end > v.line => format!("{}-{}", v.line, end),
-                    _ => v.line.to_string(),
+                    Some(end) if end > v.line => format!(":{}-{}", v.line, end),
+                    _ => format!(":{}", v.line),
                 };
-
                 writeln!(
                     w,
-                    "  {}{}:{} {}{}{}",
-                    color::GRAY,
+                    "  {}{}[{}]{} {}{}{} {}{}(rule: {}){}",
+                    color::BOLD,
+                    sev_color,
+                    tag,
+                    color::RESET,
+                    color::BOLD,
+                    v.file,
                     loc,
                     color::RESET,
-                    sev,
-                    v.severity,
-                    color::RESET,
-                )?;
-
-                writeln!(
-                    w,
-                    "    {}{}{} {}",
-                    color::BOLD,
+                    color::GRAY,
                     v.rule_id,
                     color::RESET,
-                    v.message
                 )?;
+                writeln!(w, "        {}", v.message)?;
+            }
+            writeln!(w)?;
+
+            Self::write_summary(w, &sorted, parse_errors)
+        }
+    }
+
+    /// 输出 Summary 行：非零级别计数（sql-guard 风格），全零时显示 All checks passed。
+    fn write_summary<W: IoWrite>(
+        w: &mut W,
+        violations: &[Violation],
+        parse_errors: usize,
+    ) -> io::Result<()> {
+        writeln!(w, "{}{}{}", color::GRAY, "─".repeat(SEP_WIDTH), color::RESET)?;
+        write!(w, "{}Summary{}: ", color::BOLD, color::RESET)?;
+
+        let stats = ScanStats::from_violations(violations, 0, parse_errors);
+        let mut parts: Vec<String> = Vec::new();
+        for (count, label, c) in [
+            (stats.by_severity.critical, "critical", color::RED),
+            (stats.by_severity.major, "major", color::RED),
+            (stats.by_severity.minor, "minor", color::YELLOW),
+            (stats.by_severity.info, "info", color::CYAN),
+        ] {
+            if count > 0 {
+                parts.push(format!("{c}{} {label}(s){}", count, color::RESET));
             }
         }
+        if stats.parse_errors > 0 {
+            parts.push(format!(
+                "{}{} parse error(s){}",
+                color::YELLOW, stats.parse_errors, color::RESET
+            ));
+        }
 
-        let total = violations.len();
-        let files = by_file.len();
-        writeln!(
-            w,
-            "\n{}{} violation{} in {} file{}{}",
-            color::BOLD,
-            total,
-            if total > 1 { "s" } else { "" },
-            files,
-            if files > 1 { "s" } else { "" },
-            color::RESET,
-        )?;
-
-        Ok(())
+        if parts.is_empty() {
+            writeln!(w, "{}All checks passed{}", color::GREEN, color::RESET)
+        } else {
+            writeln!(w, "{}", parts.join(" "))
+        }
     }
 }
 
@@ -489,25 +533,65 @@ mod tests {
         ]
     }
 
+    /// 去除 ANSI 转义序列，便于对纯文本内容做断言。
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // 跳过 `[...m` 形式的颜色码
+                if chars.next() == Some('[') {
+                    for c2 in chars.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     #[test]
     fn console_report_produces_output() {
         let vs = sample_violations();
         let mut buf = Vec::new();
-        ConsoleReporter::report_to(&mut buf, &vs, 0, 0, None).unwrap();
-        let output = String::from_utf8(buf).unwrap();
+        ConsoleReporter::report_to(&mut buf, &vs, 3, 0, None).unwrap();
+        let output = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(output.contains("JavaGuard Report"));
+        assert!(output.contains("Files checked: 3"));
         assert!(output.contains("Foo.java"));
         assert!(output.contains("Bar.java"));
         assert!(output.contains("J001"));
         assert!(output.contains("J002"));
-        assert!(output.contains("3 violations"));
+        // sql-guard 风格的违规行与 Summary
+        assert!(output.contains("[MAJOR]"));
+        assert!(output.contains("[MINOR]"));
+        assert!(output.contains("(rule: J001)"));
+        assert!(output.contains("Summary:"));
+        assert!(output.contains("1 major(s)"));
+        assert!(output.contains("2 minor(s)"));
     }
 
     #[test]
     fn console_report_empty() {
         let mut buf = Vec::new();
-        ConsoleReporter::report_to(&mut buf, &[], 0, 0, None).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("No issues"));
+        ConsoleReporter::report_to(&mut buf, &[], 5, 0, None).unwrap();
+        let output = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(output.contains("Files checked: 5"));
+        assert!(output.contains("No violations found"));
+        assert!(output.contains("All checks passed"));
+    }
+
+    #[test]
+    fn console_report_parse_errors_in_summary() {
+        let mut buf = Vec::new();
+        ConsoleReporter::report_to(&mut buf, &[], 2, 1, None).unwrap();
+        let output = strip_ansi(&String::from_utf8(buf).unwrap());
+        assert!(output.contains("1 parse error(s)"));
+        assert!(!output.contains("All checks passed"));
     }
 
     #[test]
