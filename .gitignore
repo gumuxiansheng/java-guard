@@ -6,6 +6,9 @@
 /test_*.txt
 /test_rhai*.txt
 
+# AST 解析缓存（根目录及各 crate 测试产生的）
+.java-guard-cache/
+
 /target-test/
 .workbuddy/
 

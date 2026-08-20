@@ -14,7 +14,9 @@ use guard_core::git_diff;
 use guard_core::reporter::{report_to, ReportFormat};
 use guard_core::rule::{Rule, Violation, ViolationCollector};
 use java_ast::ast::CompilationUnit;
-use java_ast::bridge::{CliParser, JavaParser};
+use java_ast::bridge::{CliParser, DaemonPool, JavaParser};
+use java_ast::AstCache;
+use java_ast::ParseError;
 use rule_yaml::YamlRuleAdapter;
 use rule_rhai::rule::RhaiRule;
 use crate::adapters::RhaiRuleAdapter;
@@ -140,6 +142,10 @@ enum Command {
         /// 源文件编码：auto（自动探测 BOM→UTF-8→GBK→Shift-JIS）/ utf-8 / gbk / shift-jis 等
         #[clap(long, default_value = "auto")]
         encoding: String,
+
+        /// 禁用 AST 解析缓存（默认启用，缓存目录 .java-guard-cache/）
+        #[clap(long)]
+        no_cache: bool,
     },
     /// 列出所有可用规则（内置 + YAML + Rhai）
     Rules,
@@ -155,7 +161,7 @@ fn main() {
             path, format, output, exclude, include, rules_dir, diff, semantic_diff, baseline_out,
             baseline, baseline_tolerance,
             gate, gate_config,
-            enable, disable, min_severity, parser_jar, java_cmd, config, encoding,
+            enable, disable, min_severity, parser_jar, java_cmd, config, encoding, no_cache,
         } => {
             if let Err(e) = run_scan(
                 &path, &format, output.as_deref(), exclude.as_deref(), include.as_deref(),
@@ -164,6 +170,7 @@ fn main() {
                 gate, gate_config.as_deref(),
                 enable.as_deref(), disable.as_deref(), &min_severity,
                 parser_jar.as_deref(), java_cmd.as_deref(), config.as_str(), encoding.as_str(),
+                no_cache,
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(2);
@@ -311,6 +318,28 @@ fn run_rules(unit: &CompilationUnit, rule_list: &[Arc<dyn Rule<CompilationUnit>>
     violations
 }
 
+/// 解析源码（带 AST 缓存）：命中缓存直接反序列化，跳过 JVM；未命中解析后回填。
+fn parse_with_cache(
+    parser: &dyn JavaParser,
+    cache: &AstCache,
+    source: &str,
+    filename: &str,
+) -> Result<CompilationUnit, ParseError> {
+    if let Some(json) = cache.get(source) {
+        match serde_json::from_str::<CompilationUnit>(&json) {
+            Ok(mut unit) => {
+                unit.source_file = filename.to_string();
+                unit.raw_json = json;
+                return Ok(unit);
+            }
+            Err(_) => {} // 缓存损坏 → 回退到真实解析
+        }
+    }
+    let unit = parser.parse(source, filename)?;
+    cache.put(source, &unit.raw_json);
+    Ok(unit)
+}
+
 /// 解析旧版本源码并收集违规（语义对比模式用）。
 ///
 /// - 旧版本文件不存在（新增文件）→ 空列表
@@ -318,7 +347,8 @@ fn run_rules(unit: &CompilationUnit, rule_list: &[Arc<dyn Rule<CompilationUnit>>
 fn collect_old_violations(
     rel_path: &str,
     old_ref: &str,
-    parser: &CliParser,
+    parser: &dyn JavaParser,
+    cache: &AstCache,
     rule_list: &[Arc<dyn Rule<CompilationUnit>>],
     root: &Path,
     encoding: &str,
@@ -332,7 +362,7 @@ fn collect_old_violations(
         }
     };
     let source = decode_source_bytes(&bytes, encoding);
-    match parser.parse(&source, rel_path) {
+    match parse_with_cache(parser, cache, &source, rel_path) {
         Ok(mut unit) => {
             if unit.source_file.is_empty() {
                 unit.source_file = rel_path.to_string();
@@ -378,7 +408,8 @@ fn semantic_difference(
 #[allow(clippy::too_many_arguments)]
 fn check_one_file(
     file: &Path,
-    parser: &CliParser,
+    parser: &dyn JavaParser,
+    cache: &AstCache,
     rule_list: &[Arc<dyn Rule<CompilationUnit>>],
     line_filter: &guard_core::git_diff::LineFilter,
     mapper: Option<&git_diff::LineMapper>,
@@ -403,7 +434,7 @@ fn check_one_file(
         .to_string_lossy()
         .replace('\\', "/");
 
-    match parser.parse(&source, &rel_path) {
+    match parse_with_cache(parser, cache, &source, &rel_path) {
         Ok(mut unit) => {
             if unit.source_file.is_empty() {
                 unit.source_file = rel_path.clone();
@@ -414,6 +445,7 @@ fn check_one_file(
                     &rel_path,
                     old_ref,
                     parser,
+                    cache,
                     rule_list,
                     root,
                     encoding,
@@ -474,6 +506,7 @@ fn run_scan(
     java_cmd: Option<&str>,
     config_path: &str,
     encoding: &str,
+    no_cache: bool,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
 
@@ -535,11 +568,13 @@ fn run_scan(
 
     // 查找 java-parser.jar
     let jar_path = find_parser_jar(parser_jar)?;
-    let parser_builder = CliParser::new(&jar_path);
-    let mut parser = parser_builder;
+    let mut cli_parser = CliParser::new(&jar_path);
     if let Some(cmd) = java_cmd {
-        parser = parser.with_java_cmd(cmd);
+        cli_parser = cli_parser.with_java_cmd(cmd);
     }
+
+    // AST 解析缓存（默认启用；--no-cache 关闭）
+    let cache = AstCache::new(!no_cache, &parser_fingerprint(&jar_path)?);
 
     // 收集规则
     let mut rule_list: Vec<Arc<dyn Rule<CompilationUnit>>> = rules::builtin_rules();
@@ -706,11 +741,42 @@ fn run_scan(
         enabled_count
     );
 
-    // 解析 + 检查（并行，受 CPU 核数限制；临时文件名已含调用序号，无冲突风险）
+    // 解析器选择：优先 DaemonParser 实例池（避免每文件启动 JVM），失败时回退 CliParser。
+    // 池大小 = min(CPU 核数, 4, 文件数)，常驻 JVM 内存约 32-512MB/个。
+    // 可通过环境变量 JAVAGUARD_PARSER_MODE=cli 强制使用单次模式（调试/对比用）。
+    let n_files = line_filter.0.len();
+    let force_cli = std::env::var("JAVAGUARD_PARSER_MODE").map_or(false, |m| m.eq_ignore_ascii_case("cli"));
+    let java_cmd = java_cmd
+        .map(|c| c.to_string())
+        .or_else(|| std::env::var("JAVA_CMD").ok())
+        .unwrap_or_else(|| "java".to_string());
+    let parser: Arc<dyn JavaParser> = if n_files > 0 && !force_cli {
+        let pool_size = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(4)
+            .min(n_files)
+            .max(1);
+        match DaemonPool::start(&jar_path, &java_cmd, pool_size) {
+            Ok(pool) => {
+                eprintln!("Parser: daemon pool ({pool_size} resident JVM(s))");
+                Arc::new(pool)
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: daemon parser unavailable ({e}), falling back to per-file JVM (slower)"
+                );
+                Arc::new(cli_parser)
+            }
+        }
+    } else {
+        Arc::new(cli_parser)
+    };
+
+    // 解析 + 检查（并行，受 CPU 核数限制；daemon 池内部轮询，无冲突风险）
     let mut collector = ViolationCollector::new();
     let parsed = std::sync::atomic::AtomicUsize::new(0);
     let parse_errors = std::sync::atomic::AtomicUsize::new(0);
-    let parser = Arc::new(parser);
 
     let results: Vec<FileCheck> = {
         let files = &line_filter.0;
@@ -728,6 +794,7 @@ fn run_scan(
                 for w in 0..n_workers {
                     let collected = &collected;
                     let parser = &parser;
+                    let cache = &cache;
                     let rule_list = &rule_list;
                     let line_filter = &line_filter.1;
                     let mapper = &line_mapper;
@@ -740,7 +807,8 @@ fn run_scan(
                         for idx in (w..files.len()).step_by(n_workers) {
                             let check = check_one_file(
                                 &files[idx],
-                                parser,
+                                parser.as_ref(),
+                                cache,
                                 rule_list,
                                 line_filter,
                                 mapper.as_ref(),
@@ -994,6 +1062,22 @@ fn filter_baseline(
             }
         })
         .collect()
+}
+
+/// 计算 java-parser.jar 的指纹（规范路径 + 大小 + mtime），用于缓存失效控制。
+fn parser_fingerprint(jar: &Path) -> anyhow::Result<String> {
+    let meta = std::fs::metadata(jar)?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(format!(
+        "{}|{}|{mtime_ns}",
+        jar.display(),
+        meta.len()
+    ))
 }
 
 /// 查找 java-parser.jar。

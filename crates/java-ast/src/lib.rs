@@ -7,7 +7,9 @@
 
 pub mod ast;
 pub mod bridge;
+pub mod cache;
 pub mod error;
 
-pub use bridge::{CliParser, JavaParser};
+pub use bridge::{CliParser, DaemonParser, DaemonPool, JavaParser, DAEMON_JVM_ARGS};
+pub use cache::AstCache;
 pub use error::ParseError;

@@ -1,13 +1,14 @@
 //! RhaiRuleAdapter：将 RhaiRule 包装为 Rule<CompilationUnit>。
+//!
+//! 通过 engine::run_cached 复用线程级 Engine / 脚本编译 / AST 转换缓存，
+//! 避免每个 (文件 × 规则) 重复初始化引擎。
 
 use guard_core::rule::{Rule, RuleId, Severity, Violation};
 use java_ast::ast::CompilationUnit;
-use rule_rhai::engine::RhaiRuleEngine;
+use rule_rhai::engine::run_cached;
 use rule_rhai::rule::RhaiRule;
 
 /// 将 RhaiRule 适配为 Rule<CompilationUnit>。
-///
-/// 不存储 Engine（非 Send+Sync），每次 check_unit 时创建。
 pub struct RhaiRuleAdapter {
     rule: RhaiRule,
     rule_id: RuleId,
@@ -47,8 +48,7 @@ impl Rule<CompilationUnit> for RhaiRuleAdapter {
         } else {
             &unit.source_file
         };
-        let engine = RhaiRuleEngine::new();
-        match engine.run(&self.rule, unit, file) {
+        match run_cached(&self.rule, unit, file) {
             Ok(vs) => vs,
             Err(e) => {
                 eprintln!(

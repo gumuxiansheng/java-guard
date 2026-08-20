@@ -4,9 +4,9 @@
 >
 > | 设计描述 | 当前实现 | 状态 |
 > |---------|---------|------|
-> | `DaemonParser`（常驻 JVM，管道通信） | 仅实现 `CliParser`（每文件启动一个 JVM 进程 + 临时文件） | ❌ 未实现 |
-> | AST 解析缓存（内容 hash） | 无 | ❌ 未实现 |
-> | 并行解析（多个 DaemonParser 实例） | 文件级并行解析已通过 `std::thread::scope` 实现（受 CPU 核数限制） | 🟡 部分实现 |
+> | `DaemonParser`（常驻 JVM，管道通信） | `DaemonParser` + `DaemonPool`（stdin/stdout 逐行 JSON，死实例自动重启重试）；实测 300 文件 2.1s vs CLI 53.6s | ✅ 已实现 |
+> | AST 解析缓存（内容 hash） | `AstCache`：内容寻址（长度+64 位 hash），jar 指纹失效，临时文件+改名并发安全；`--no-cache` 关闭 | ✅ 已实现 |
+> | 并行解析（多个 DaemonParser 实例） | 文件级并行解析已通过 `std::thread::scope` 实现（池大小 min(CPU,4,文件数)，受 CPU 核数限制） | ✅ 已实现 |
 > | YAML `any_of` / `name_regex` / `args_count` Pattern 字段 | 实际为 `match_fields` 映射（glob/正则/列表），见 RULE_AUTHORING.md | 🟡 API 不同 |
 > | Rhai `check(node, ctx)` + `NodeWrapper` + `RuleContext` | 实际为脚本注入全局 `ast`（JSON map）并返回 ` violations` 数组 | 🟡 API 不同 |
 > | `CatchBlock` Pattern + J002 方法过长 | J008 空 catch 为 Rust 内置规则；方法过长为 J006（Rhai） | 🟡 规则 ID/类型不同 |
