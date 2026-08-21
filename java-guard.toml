@@ -1,0 +1,43 @@
+# =============================================================================
+# java-guard 项目配置文件
+#
+# 规则配置独立存放在 javaguard.rules.toml（通过 rules_file 引用）；
+# 本文件只包含扫描行为、CI gate 等项目级配置。
+# =============================================================================
+
+# ── 规则配置 ──────────────────────────────────────────────────────────────────
+
+[rules]
+# 规则配置文件路径（相对于本文件所在目录解析）
+# 不写时自动查找同目录下的 javaguard.rules.toml
+rules_file = "javaguard.rules.toml"
+
+# 只启用指定规则（覆盖 rules_file 中的 enabled 字段）
+# enable = ["J001", "J003"]
+
+# 禁用指定规则（覆盖 rules_file 中的 enabled 字段）
+# disable = ["J008"]
+
+# 最低严重级别：info / minor / major / critical
+# min_severity = "info"
+
+# ── 扫描配置 ──────────────────────────────────────────────────────────────────
+
+[scan]
+# 路径白名单（只扫描匹配路径）
+# include = ["src/main", "src/test"]
+
+# 路径黑名单（排除目录）
+# exclude = ["build", "dist", "generated"]
+
+# 源文件编码：auto（自动探测）/ utf-8 / gbk / shift-jis 等
+# encoding = "auto"
+
+# ── CI Gate 配置 ──────────────────────────────────────────────────────────────
+
+[gate]
+# 违规超过阈值时退出码 1（配合 --gate 使用）
+max_critical = 0
+max_major = 0
+max_minor = 10
+max_info = 50

@@ -1,0 +1,149 @@
+# =============================================================================
+# java-guard 规则配置
+#
+# 每条 [[rules]] 定义一个规则的元数据和控制参数。
+# 脚本路径（script_path）相对于本文件所在目录解析，也支持绝对路径。
+# 内置 Rust 规则使用 builtin: 前缀（如 builtin:j008_empty_catch）。
+#
+# 在 java-guard.toml 中用 rules_file = "javaguard.rules.toml" 引用本文件；
+# 不写该行时，工具也会自动在同目录查找 javaguard.rules.toml。
+# =============================================================================
+
+# ── 命名规范 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J004"
+name = "class_naming"
+group = "naming"
+description = "类名必须使用 PascalCase（大写驼峰）"
+script_path = "rules/J004_class_naming.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J005"
+name = "method_naming"
+group = "naming"
+description = "方法名必须使用 camelCase（小写驼峰）"
+script_path = "rules/J005_method_naming.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J007"
+name = "constant_naming"
+group = "naming"
+description = "常量（static final 字段）必须使用 UPPER_SNAKE_CASE"
+script_path = "rules/J007_constant_naming.yml"
+severity = "info"
+enabled = true
+
+# ── 代码规范 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J001"
+name = "no_system_out"
+group = "code-style"
+description = "禁止使用 System.out / System.err 直接打印，请使用日志框架（SLF4J）"
+script_path = "rules/J001_no_system_out.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J003"
+name = "no_wildcard_import"
+group = "code-style"
+description = "import 不使用通配符（*），应明确导入具体类"
+script_path = "rules/J003_no_wildcard_import.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J006"
+name = "long_method"
+group = "code-style"
+description = "单个方法不超过 50 行（可通过 params 自定义阈值）"
+script_path = "rules/rhai/J006_long_method.rhai"
+severity = "info"
+enabled = true
+
+[rules.params]
+max_lines = 50
+
+# ── 依赖安全 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J010"
+name = "no_fastjson_import"
+group = "dependency-security"
+description = "禁止 import fastjson / fastjson2，推荐使用 jackson"
+script_path = "rules/J010_no_fastjson.yml"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J011"
+name = "commons_lang3_stringutils"
+group = "dependency-security"
+description = "StringUtils 应使用 org.apache.commons.lang3.StringUtils，不要自定义或使用其他实现"
+script_path = "rules/rhai/J011_stringutils.rhai"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J012"
+name = "no_fastjson_usage"
+group = "dependency-security"
+description = "代码中禁止直接使用 fastjson / fastjson2 的类（如 JSONObject, JSONArray）"
+script_path = "rules/rhai/J012_fastjson_usage.rhai"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J014"
+name = "no_nonjackson_json_import"
+group = "dependency-security"
+description = "禁止引入非 jackson 的 JSON 框架（gson, org.json, net.sf.json 等）"
+script_path = "rules/J014_no_nonjackson_json.yml"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J015"
+name = "no_nonjackson_json_usage"
+group = "dependency-security"
+description = "代码中禁止使用非 jackson JSON 框架的类（如 Gson, JSONObject from org.json）"
+script_path = "rules/rhai/J015_nonjackson_json_usage.rhai"
+severity = "warning"
+enabled = true
+
+# ── 潜在缺陷 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J008"
+name = "empty_catch"
+group = "potential-bug"
+description = "空 catch 块：catch 内部没有任何语句，会吞掉异常"
+script_path = "builtin:J008"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J009"
+name = "infinite_loop"
+group = "potential-bug"
+description = "潜在死循环：for(;;)、while(true)、或缺少更新条件的循环"
+script_path = "builtin:J009"
+severity = "warning"
+enabled = true
+
+# ── Spring 规范 ──────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J013"
+name = "controller_no_map_param"
+group = "spring-convention"
+description = "Spring Controller HTTP 接口禁止使用 Map 作为方法参数"
+script_path = "rules/rhai/J013_controller_no_map_param.rhai"
+severity = "warning"
+enabled = true

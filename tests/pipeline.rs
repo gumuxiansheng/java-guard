@@ -93,7 +93,7 @@ fn pipeline_reports_violations_on_fixtures() {
     };
 
     let fixtures = PathBuf::from(manifest).join("tests/fixtures");
-    let rules_dir = PathBuf::from(manifest).join("rules");
+    let rules_file = PathBuf::from(manifest).join("javaguard.rules.toml");
 
     let output = Command::new(bin)
         .arg("scan")
@@ -102,11 +102,11 @@ fn pipeline_reports_violations_on_fixtures() {
         .arg("json")
         .arg("--parser-jar")
         .arg(&jar)
-        .arg("--rules-dir")
-        .arg(&rules_dir)
-        // 用不存在的配置文件，确保不读取 cwd 下任何 java-guard.yml 干扰断言
+        .arg("--rules-file")
+        .arg(&rules_file)
+        // 用不存在的配置文件，确保不读取 cwd 下任何 java-guard.toml 干扰断言
         .arg("--config")
-        .arg("__none__.yml")
+        .arg("__none__.toml")
         .env("JAVA_CMD", &java)
         .output()
         .expect("failed to execute java-guard");
@@ -181,7 +181,7 @@ fn pipeline_j009_infinite_loop_real_parse() {
     };
 
     let fixture = PathBuf::from(manifest).join("tests/fixtures/LoopCases.java");
-    let rules_dir = PathBuf::from(manifest).join("rules");
+    let rules_file = PathBuf::from(manifest).join("javaguard.rules.toml");
 
     let output = Command::new(bin)
         .arg("scan")
@@ -190,10 +190,10 @@ fn pipeline_j009_infinite_loop_real_parse() {
         .arg("json")
         .arg("--parser-jar")
         .arg(&jar)
-        .arg("--rules-dir")
-        .arg(&rules_dir)
+        .arg("--rules-file")
+        .arg(&rules_file)
         .arg("--config")
-        .arg("__none__.yml")
+        .arg("__none__.toml")
         .env("JAVA_CMD", &java)
         .output()
         .expect("failed to execute java-guard");

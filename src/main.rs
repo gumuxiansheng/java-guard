@@ -12,7 +12,7 @@ use clap::Parser;
 use guard_core::gate::{GateConfig, GateResult, SeverityCounts};
 use guard_core::git_diff;
 use guard_core::reporter::{report_to, ReportFormat};
-use guard_core::rule::{Rule, Violation, ViolationCollector};
+use guard_core::rule::{Rule, RuleId, Violation, ViolationCollector};
 use java_ast::ast::CompilationUnit;
 use java_ast::bridge::{CliParser, DaemonPool, JavaParser};
 use java_ast::AstCache;
@@ -60,7 +60,7 @@ enum Command {
     /// 进行静态分析，输出违规报告。支持增量扫描、CI gate、多种报告格式。
     #[clap(
         verbatim_doc_comment,
-        after_help = "Examples:\n  java-guard scan .                      # Scan current directory\n  java-guard scan src/main -f json -o report.json\n  java-guard scan . --diff HEAD~1         # Only scan changed files\n  java-guard scan . --gate --gate-config gate.yml\n  java-guard scan . --encoding gbk       # Specify source encoding\n  java-guard scan . --enable J008,J009 --disable J003\n"
+        after_help = "Examples:\n  java-guard scan .                      # Scan current directory\n  java-guard scan src/main -f json -o report.json\n  java-guard scan . --diff HEAD~1         # Only scan changed files\n  java-guard scan . --gate --gate-config gate.yml\n  java-guard scan . --encoding gbk       # Specify source encoding\n  java-guard scan . --enable J008,J009 --disable J003\n  java-guard scan . --rules-file javaguard.rules.toml\n"
     )]
     Scan {
         /// 扫描路径（文件或目录，默认当前目录）
@@ -83,9 +83,9 @@ enum Command {
         #[clap(short = 'I', long)]
         include: Option<String>,
 
-        /// YAML/Rhai 规则目录（默认 rules/，其下 rhai/ 子目录放 Rhai 脚本）
+        /// 规则配置文件路径（TOML，含规则元数据和脚本路径；覆盖配置文件中的 rules_file）
         #[clap(short = 'r', long)]
-        rules_dir: Option<String>,
+        rules_file: Option<String>,
 
         /// 增量扫描：只检查 git diff 变更的文件（如 HEAD~1 或 main...feature）
         #[clap(long)]
@@ -135,8 +135,8 @@ enum Command {
         #[clap(long, env = "JAVA_CMD")]
         java_cmd: Option<String>,
 
-        /// 项目配置文件路径（YAML，含 rules/scan/gate 配置）
-        #[clap(long, default_value = "java-guard.yml")]
+        /// 项目配置文件路径（TOML，含 rules/scan/gate 配置）
+        #[clap(long, default_value = "java-guard.toml")]
         config: String,
 
         /// 源文件编码：auto（自动探测 BOM→UTF-8→GBK→Shift-JIS）/ utf-8 / gbk / shift-jis 等
@@ -158,14 +158,14 @@ fn main() {
 
     match cli.command {
         Command::Scan {
-            path, format, output, exclude, include, rules_dir, diff, semantic_diff, baseline_out,
+            path, format, output, exclude, include, rules_file, diff, semantic_diff, baseline_out,
             baseline, baseline_tolerance,
             gate, gate_config,
             enable, disable, min_severity, parser_jar, java_cmd, config, encoding, no_cache,
         } => {
             if let Err(e) = run_scan(
                 &path, &format, output.as_deref(), exclude.as_deref(), include.as_deref(),
-                rules_dir.as_deref(), diff.as_deref(), semantic_diff, baseline_out.as_deref(),
+                rules_file.as_deref(), diff.as_deref(), semantic_diff, baseline_out.as_deref(),
                 baseline.as_deref(), baseline_tolerance,
                 gate, gate_config.as_deref(),
                 enable.as_deref(), disable.as_deref(), &min_severity,
@@ -177,19 +177,46 @@ fn main() {
             }
         }
         Command::Rules => {
-            println!("Built-in rules:");
-            for r in rules::builtin_rules() {
-                println!("  {} [{}] {}", r.id(), r.severity(), r.description());
-            }
-            let yaml_rules = load_yaml_rules(Path::new("rules"));
-            for r in &yaml_rules {
-                println!("  {} [{}] {} (YAML)", r.id, r.severity, r.title);
-            }
-            let rhai_dir = Path::new("rules").join("rhai");
-            if rhai_dir.is_dir() {
-                if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
-                    for r in &rhai_rules {
-                        println!("  {} [{}] {} (Rhai)", r.id, r.severity, r.title);
+            // 优先从 java-guard.toml 的 rules_file 加载规则列表
+            let project_config = load_project_config("java-guard.toml").unwrap_or_default();
+            let rules_file_path = project_config
+                .rules
+                .rules_file
+                .as_deref()
+                .unwrap_or("javaguard.rules.toml");
+            match load_rules_file(rules_file_path) {
+                Ok(entries) if !entries.is_empty() => {
+                    println!("Rules (from {}):", rules_file_path);
+                    println!("{:<8} {:<30} {:<10} {:<8} {}", "ID", "Name", "Group", "Severity", "Description");
+                    println!("{}", "-".repeat(90));
+                    for entry in &entries {
+                        let group = entry.group.as_deref().unwrap_or("-");
+                        let desc = entry.description.as_deref().unwrap_or("");
+                        let enabled_mark = if entry.enabled { "" } else { " [disabled]" };
+                        println!(
+                            "{:<8} {:<30} {:<10} {:<8} {}{}",
+                            entry.id, entry.name, group, entry.severity, desc, enabled_mark
+                        );
+                    }
+                }
+                _ => {
+                    // 回退：扫描 rules/ 目录
+                    println!("Rules (from rules/ directory):");
+                    println!("Built-in rules:");
+                    for r in rules::builtin_rules() {
+                        println!("  {} [{}] {}", r.id(), r.severity(), r.description());
+                    }
+                    let yaml_rules = load_yaml_rules(Path::new("rules"));
+                    for r in &yaml_rules {
+                        println!("  {} [{}] {} (YAML)", r.id, r.severity, r.title);
+                    }
+                    let rhai_dir = Path::new("rules").join("rhai");
+                    if rhai_dir.is_dir() {
+                        if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
+                            for r in &rhai_rules {
+                                println!("  {} [{}] {} (Rhai)", r.id, r.severity, r.title);
+                            }
+                        }
                     }
                 }
             }
@@ -491,7 +518,7 @@ fn run_scan(
     output: Option<&str>,
     exclude: Option<&str>,
     include: Option<&str>,
-    rules_dir: Option<&str>,
+    rules_file: Option<&str>,
     diff: Option<&str>,
     semantic_diff: bool,
     baseline_out: Option<&str>,
@@ -577,27 +604,59 @@ fn run_scan(
     let cache = AstCache::new(!no_cache, &parser_fingerprint(&jar_path)?);
 
     // 收集规则
-    let mut rule_list: Vec<Arc<dyn Rule<CompilationUnit>>> = rules::builtin_rules();
+    let builtin = rules::builtin_rules();
+    let mut rule_list: Vec<Arc<dyn Rule<CompilationUnit>>> = Vec::new();
 
-    let yaml_dir = rules_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules"));
+    // 确定规则文件路径：CLI --rules_file > 配置文件 rules_file > 默认 javaguard.rules.toml
+    let config_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or(Path::new("."));
+    let effective_rules_file = rules_file
+        .map(|s| s.to_string())
+        .or_else(|| project_config.rules.rules_file.clone())
+        .unwrap_or_else(|| "javaguard.rules.toml".to_string());
+    let resolved_rules_file = if Path::new(&effective_rules_file).is_absolute() {
+        PathBuf::from(&effective_rules_file)
+    } else {
+        config_dir.join(&effective_rules_file)
+    };
 
-    let yaml_rules = load_yaml_rules(&yaml_dir);
-    for yr in yaml_rules {
-        rule_list.push(Arc::new(YamlRuleAdapter::new(yr)));
-    }
-
-    let rhai_dir = yaml_dir.join("rhai");
-    if rhai_dir.is_dir() {
-        match load_rhai_rules(&rhai_dir) {
-            Ok(rules) => {
-                for rr in rules {
-                    rule_list.push(Arc::new(RhaiRuleAdapter::new(rr)));
+    // 优先从 TOML 规则文件加载
+    let loaded_from_toml = match load_rules_file(resolved_rules_file.to_str().unwrap_or("")) {
+        Ok(entries) if !entries.is_empty() => {
+            let config_dir_for_rules = resolved_rules_file
+                .parent()
+                .unwrap_or(Path::new("."));
+            for entry in &entries {
+                if let Some(r) = load_rule_from_entry(entry, config_dir_for_rules, &builtin) {
+                    rule_list.push(r);
                 }
             }
-            Err(e) => {
-                eprintln!("warn: failed to load rhai rules: {e}");
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            eprintln!("warn: failed to load rules file: {e}");
+            false
+        }
+    };
+
+    // 回退：目录扫描（向后兼容旧版 rules/ 目录结构）
+    if !loaded_from_toml {
+        for r in &builtin {
+            rule_list.push(r.clone());
+        }
+        let yaml_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules");
+        let yaml_rules = load_yaml_rules(&yaml_dir);
+        for yr in yaml_rules {
+            rule_list.push(Arc::new(YamlRuleAdapter::new(yr)));
+        }
+        let rhai_dir = yaml_dir.join("rhai");
+        if rhai_dir.is_dir() {
+            if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
+                for rr in rhai_rules {
+                    rule_list.push(Arc::new(RhaiRuleAdapter::new(rr)));
+                }
             }
         }
     }
@@ -1107,7 +1166,7 @@ fn find_parser_jar(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
     ))
 }
 
-/// 项目级配置文件 java-guard.yml 的模型。
+/// 项目级配置文件 java-guard.toml 的模型。
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct ProjectConfig {
@@ -1122,14 +1181,14 @@ struct ProjectConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct RulesConfig {
-    /// 启用的规则 ID 列表（为空则全部启用）
+    /// 规则配置文件路径（相对于本配置文件目录解析）
+    rules_file: Option<String>,
+    /// 启用的规则 ID 列表（为空则全部启用；覆盖 rules_file 中的 enabled 字段）
     enable: Vec<String>,
-    /// 禁用的规则 ID 列表
+    /// 禁用的规则 ID 列表（覆盖 rules_file 中的 enabled 字段）
     disable: Vec<String>,
     /// 最低严重级别
     min_severity: Option<String>,
-    /// 规则参数
-    params: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1143,7 +1202,62 @@ struct ScanConfig {
     encoding: Option<String>,
 }
 
-/// 加载项目配置文件。文件不存在时返回默认值（不报错）。
+/// 一条规则的完整定义（TOML [[rules]] 条目）。
+///
+/// 包含规则的元数据（name, group, description）和脚本路径（script_path）。
+/// 脚本路径相对于规则文件所在目录解析，也支持绝对路径。
+/// 内置 Rust 规则使用 `builtin:xxx` 前缀（如 `builtin:j008_empty_catch`）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RuleEntry {
+    /// 规则 ID（如 "J001"），全局唯一
+    pub id: String,
+    /// 规则名称（如 "no_system_out"），用于日志和输出
+    pub name: String,
+    /// 规则分组（如 "naming", "code-style", "dependency-security"）
+    #[serde(default)]
+    pub group: Option<String>,
+    /// 规则描述（如 "禁止使用 System.out / System.err 直接打印"）
+    #[serde(default)]
+    pub description: Option<String>,
+    /// 规则脚本路径（YAML/Rhai 文件）或 `builtin:xxx` 标识
+    /// 相对于规则文件所在目录解析
+    pub script_path: String,
+    /// 该规则适用的文件类型（目前固定 ["java"]）
+    #[serde(default = "default_applies_to")]
+    pub applies_to: Vec<String>,
+    /// 严重级别：info / minor / major / critical
+    #[serde(default = "default_severity")]
+    pub severity: String,
+    /// 是否启用
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 规则分组内的参数（如 max_lines 等，传递给 Rhai 脚本的 `config` 变量）
+    #[serde(default)]
+    pub params: Option<toml::Value>,
+}
+
+fn default_applies_to() -> Vec<String> {
+    vec!["java".to_string()]
+}
+
+fn default_severity() -> String {
+    "info".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 规则文件的完整结构（javaguard.rules.toml）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RulesFile {
+    /// 规则列表
+    pub rules: Vec<RuleEntry>,
+}
+
+/// 加载项目配置文件（TOML 格式）。
+///
+/// 文件不存在时返回默认值（不报错）。
 fn load_project_config(path: &str) -> anyhow::Result<ProjectConfig> {
     let p = Path::new(path);
     if !p.exists() {
@@ -1151,9 +1265,176 @@ fn load_project_config(path: &str) -> anyhow::Result<ProjectConfig> {
     }
     let content = std::fs::read_to_string(p)
         .map_err(|e| anyhow::anyhow!("read config {path}: {e}"))?;
-    let cfg: ProjectConfig = serde_yaml::from_str(&content)
+    let cfg: ProjectConfig = toml::from_str(&content)
         .map_err(|e| anyhow::anyhow!("parse config {path}: {e}"))?;
     Ok(cfg)
+}
+
+/// 加载规则文件（javaguard.rules.toml）。
+///
+/// 文件不存在时返回空列表（不报错）。
+fn load_rules_file(path: &str) -> anyhow::Result<Vec<RuleEntry>> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(p)
+        .map_err(|e| anyhow::anyhow!("read rules file {path}: {e}"))?;
+    let file: RulesFile = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("parse rules file {path}: {e}"))?;
+    // 校验 rule ID 唯一性
+    let mut seen = std::collections::HashSet::new();
+    for rule in &file.rules {
+        if !seen.insert(&rule.id) {
+            return Err(anyhow::anyhow!("duplicate rule ID: {}", rule.id));
+        }
+    }
+    Ok(file.rules)
+}
+
+/// 根据 RuleEntry 加载实际的规则执行器。
+///
+/// - `builtin:xxx` → 查找内置 Rust 规则
+/// - `*.yml`/`*.yaml` → 加载 YAML 声明式规则
+/// - `*.rhai` → 加载 Rhai 脚本规则
+fn load_rule_from_entry(
+    entry: &RuleEntry,
+    config_dir: &Path,
+    builtin: &[Arc<dyn Rule<CompilationUnit>>],
+) -> Option<Arc<dyn Rule<CompilationUnit>>> {
+    let script_path = &entry.script_path;
+
+    if let Some(name) = script_path.strip_prefix("builtin:") {
+        // 内置 Rust 规则
+        return builtin.iter().find(|r| r.id().0 == name).cloned().map(|r| {
+            // 用 RuleEntry 的元数据覆盖内置规则的元数据
+            Arc::new(BuiltinRuleOverride::new(r, entry.clone())) as Arc<dyn Rule<CompilationUnit>>
+        });
+    }
+
+    // 解析脚本路径（相对于配置文件所在目录）
+    let resolved = if Path::new(script_path).is_absolute() {
+        PathBuf::from(script_path)
+    } else {
+        config_dir.join(script_path)
+    };
+
+    if !resolved.exists() {
+        eprintln!("warn: rule {} script not found: {}", entry.id, resolved.display());
+        return None;
+    }
+
+    let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "yml" | "yaml" => match rule_yaml::load_rule_file(&resolved) {
+            Ok(mut yaml_rule) => {
+                // 用 RuleEntry 的元数据覆盖 YAML 文件的元数据
+                yaml_rule.id = entry.id.clone();
+                if let Some(ref desc) = entry.description {
+                    yaml_rule.title = desc.clone();
+                }
+                yaml_rule.severity = entry.severity.clone();
+                yaml_rule.enabled = entry.enabled;
+                Some(Arc::new(YamlRuleAdapter::new(yaml_rule)))
+            }
+            Err(e) => {
+                eprintln!("warn: skip rule {}: {}", entry.id, e);
+                None
+            }
+        },
+        "rhai" => match rule_rhai::rule::load_rhai_rule_file(&resolved) {
+            Ok(mut rhai_rule) => {
+                // 用 RuleEntry 的元数据覆盖 Rhai 文件的元数据
+                rhai_rule.id = entry.id.clone();
+                if let Some(ref desc) = entry.description {
+                    rhai_rule.title = desc.clone();
+                }
+                rhai_rule.severity = entry.severity.clone();
+                rhai_rule.enabled = entry.enabled;
+                // 将 toml::Value 转为 serde_yaml::Value 传递 params
+                if let Some(ref params) = entry.params {
+                    rhai_rule.params = toml_value_to_yaml(params);
+                }
+                Some(Arc::new(RhaiRuleAdapter::new(rhai_rule)))
+            }
+            Err(e) => {
+                eprintln!("warn: skip rule {}: {}", entry.id, e);
+                None
+            }
+        },
+        _ => {
+            eprintln!("warn: skip rule {}: unsupported file extension '{}'", entry.id, ext);
+            None
+        }
+    }
+}
+
+/// 将 toml::Value 递归转换为 serde_yaml::Value。
+fn toml_value_to_yaml(v: &toml::Value) -> serde_yaml::Value {
+    match v {
+        toml::Value::String(s) => serde_yaml::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_yaml::Value::Number((*i).into()),
+        toml::Value::Float(f) => serde_yaml::Value::Number(serde_yaml::Number::from(*f)),
+        toml::Value::Boolean(b) => serde_yaml::Value::Bool(*b),
+        toml::Value::Array(arr) => {
+            serde_yaml::Value::Sequence(arr.iter().map(toml_value_to_yaml).collect())
+        }
+        toml::Value::Table(map) => {
+            let mut yaml_map = serde_yaml::Mapping::new();
+            for (k, v) in map {
+                yaml_map.insert(
+                    serde_yaml::Value::String(k.clone()),
+                    toml_value_to_yaml(v),
+                );
+            }
+            serde_yaml::Value::Mapping(yaml_map)
+        }
+        toml::Value::Datetime(dt) => serde_yaml::Value::String(dt.to_string()),
+    }
+}
+
+/// 包装内置规则，用 RuleEntry 元数据覆盖 severity / enabled。
+///
+/// description() 委托给内置规则（lifetime 限制无法返回 RuleEntry 的 &str）。
+/// RuleEntry 的 description 在 `rules` 命令中直接使用。
+struct BuiltinRuleOverride {
+    inner: Arc<dyn Rule<CompilationUnit>>,
+    entry: RuleEntry,
+}
+
+impl BuiltinRuleOverride {
+    fn new(inner: Arc<dyn Rule<CompilationUnit>>, entry: RuleEntry) -> Self {
+        Self { inner, entry }
+    }
+}
+
+impl Rule<CompilationUnit> for BuiltinRuleOverride {
+    fn id(&self) -> &RuleId {
+        self.inner.id()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn severity(&self) -> guard_core::rule::Severity {
+        self.entry
+            .severity
+            .parse()
+            .unwrap_or_else(|_| self.inner.severity())
+    }
+
+    fn enabled(&self) -> bool {
+        self.entry.enabled
+    }
+
+    fn check_unit(&self, unit: &CompilationUnit) -> Vec<Violation> {
+        self.inner.check_unit(unit)
+    }
+
+    fn span_policy(&self) -> guard_core::rule::SpanPolicy {
+        self.inner.span_policy()
+    }
 }
 
 #[cfg(test)]
@@ -1199,7 +1480,7 @@ mod tests {
 
     #[test]
     fn load_project_config_missing_returns_default() {
-        let cfg = load_project_config("__nonexistent_config_12345.yml").unwrap();
+        let cfg = load_project_config("__nonexistent_config_12345.toml").unwrap();
         assert!(cfg.rules.enable.is_empty());
         assert!(cfg.rules.disable.is_empty());
         assert!(cfg.scan.include.is_empty());
@@ -1208,26 +1489,85 @@ mod tests {
     }
 
     #[test]
-    fn load_project_config_parses_rules() {
+    fn load_project_config_parses_toml() {
         let dir = std::env::temp_dir().join("javaguard_cfg_test");
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("java-guard.yml");
-        let yaml = concat!(
-            "rules:\n",
-            "  enable: [J001, J003]\n",
-            "  disable: [J008]\n",
-            "  min_severity: major\n",
-            "scan:\n",
-            "  include: [src/main]\n",
-            "  exclude: [build]\n",
-        );
-        std::fs::write(&path, yaml).unwrap();
+        let path = dir.join("java-guard.toml");
+        let toml_content = r#"
+[rules]
+enable = ["J001", "J003"]
+disable = ["J008"]
+min_severity = "major"
+
+[scan]
+include = ["src/main"]
+exclude = ["build"]
+"#;
+        std::fs::write(&path, toml_content).unwrap();
         let cfg = load_project_config(path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.rules.enable, vec!["J001".to_string(), "J003".to_string()]);
         assert_eq!(cfg.rules.disable, vec!["J008".to_string()]);
         assert_eq!(cfg.rules.min_severity.as_deref(), Some("major"));
         assert_eq!(cfg.scan.include, vec!["src/main".to_string()]);
         assert_eq!(cfg.scan.exclude, vec!["build".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_parses_toml() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[[rules]]
+id = "J001"
+name = "no_system_out"
+group = "code-style"
+description = "禁止使用 System.out / System.err 直接打印"
+script_path = "rules/J001_no_system_out.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J008"
+name = "empty_catch"
+group = "potential-bug"
+description = "空 catch 块检测"
+script_path = "builtin:j008_empty_catch"
+severity = "warning"
+enabled = false
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        let entries = load_rules_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "J001");
+        assert_eq!(entries[0].name, "no_system_out");
+        assert_eq!(entries[0].group.as_deref(), Some("code-style"));
+        assert_eq!(entries[0].severity, "info");
+        assert!(entries[0].enabled);
+        assert_eq!(entries[1].id, "J008");
+        assert!(!entries[1].enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_duplicate_id_errors() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test2");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[[rules]]
+id = "J001"
+name = "a"
+script_path = "x.yml"
+
+[[rules]]
+id = "J001"
+name = "b"
+script_path = "y.yml"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        assert!(load_rules_file(path.to_str().unwrap()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
