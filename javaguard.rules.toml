@@ -147,3 +147,21 @@ description = "Spring Controller HTTP 鎺ュ彛绂佹浣跨敤 Map 浣滀负鏂规硶鍙傛暟"
 script_path = "rules/rhai/J013_controller_no_map_param.rhai"
 severity = "warning"
 enabled = true
+
+[[rules]]
+id = "J016"
+name = "throw_must_log"
+group = "potential-bug"
+description = "catch 块中抛出异常前必须先通过 SLF4J 记录日志，禁止静默抛错"
+script_path = "builtin:J016"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J017"
+name = "no_direct_log_impl"
+group = "code-style"
+description = "日志必须使用门面（SLF4J），禁止直接 import 具体日志实现（JUL / Log4j / Logback）"
+script_path = "rules/J017_no_direct_log_impl.yml"
+severity = "warning"
+enabled = true

@@ -147,6 +147,16 @@ fn pipeline_reports_violations_on_fixtures() {
         rule_ids.iter().any(|r| *r == "J003"),
         "expected J003 (wildcard import) violations, got: {rule_ids:?}"
     );
+    // J016 catch 中静默抛错（未先记录日志）：RuleViolations.java 的 silentRethrow 命中
+    assert!(
+        rule_ids.iter().any(|r| *r == "J016"),
+        "expected J016 (rethrow without logging) violations, got: {rule_ids:?}"
+    );
+    // J017 禁止直接使用日志实现：RuleViolations.java 的 org.apache.log4j.Logger 命中
+    assert!(
+        rule_ids.iter().any(|r| *r == "J017"),
+        "expected J017 (direct log impl import) violations, got: {rule_ids:?}"
+    );
 
     // 每条 violation 都应带合法行号与文件路径
     for v in violations {

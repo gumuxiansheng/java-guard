@@ -207,6 +207,8 @@ enabled = true
 | J013 | spring-convention | warning | controller_no_map_param | Spring Controller 禁止 Map 传参 |
 | J014 | dependency-security | warning | no_nonjackson_json_import | 禁止引入非 jackson 的 JSON 框架 |
 | J015 | dependency-security | warning | no_nonjackson_json_usage | 禁止使用非 jackson JSON 框架的类 |
+| J016 | potential-bug | warning | throw_must_log | catch 中抛错必须先用 SLF4J 记录日志，禁止静默抛错 |
+| J017 | code-style | warning | no_direct_log_impl | 日志必须使用门面（SLF4J），禁止直接使用具体日志实现 |
 
 ## 主要特性
 

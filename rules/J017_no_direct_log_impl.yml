@@ -1,0 +1,20 @@
+id: J017
+title: "日志必须使用门面（SLF4J），禁止直接使用具体日志实现"
+severity: major
+category: convention
+pattern:
+  type: Import
+  match_fields:
+    # 日志记录必须通过门面（团队统一 SLF4J：org.slf4j.*），
+    # 禁止在业务代码中直接 import 任何具体日志实现的 API：
+    # - java.util.logging（JUL，JDK 自带实现）
+    # - org.apache.log4j（Log4j 1.x，EOL）
+    # - org.apache.logging.log4j（Log4j 2.x API/Core）
+    # - ch.qos.logback（Logback 实现类只应出现在依赖/配置中，不应出现在代码 import 里）
+    package:
+      - "java.util.logging*"
+      - "org.apache.log4j*"
+      - "org.apache.logging.log4j*"
+      - "ch.qos.logback*"
+message: "禁止直接使用具体日志实现（{package}），请统一使用 SLF4J 门面（org.slf4j.Logger / LoggerFactory）"
+

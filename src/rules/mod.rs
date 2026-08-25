@@ -2,6 +2,7 @@
 
 pub mod j008_empty_catch;
 pub mod j009_infinite_loop;
+pub mod j016_throw_must_log;
 
 use guard_core::rule::Rule;
 use java_ast::ast::CompilationUnit;
@@ -12,5 +13,6 @@ pub fn builtin_rules() -> Vec<Arc<dyn Rule<CompilationUnit>>> {
     vec![
         Arc::new(j008_empty_catch::EmptyCatchRule::new()),
         Arc::new(j009_infinite_loop::InfiniteLoopRule::new()),
+        Arc::new(j016_throw_must_log::ThrowMustLogRule::new()),
     ]
 }
