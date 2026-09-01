@@ -62,6 +62,8 @@ impl FromStr for Severity {
         match s.trim().to_lowercase().as_str() {
             "info" => Ok(Severity::Info),
             "minor" => Ok(Severity::Minor),
+            // 兼容别名：规则作者常写 warning，等价于 minor
+            "warning" => Ok(Severity::Minor),
             "major" => Ok(Severity::Major),
             "critical" => Ok(Severity::Critical),
             other => Err(SeverityParseError(other.to_string())),

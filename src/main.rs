@@ -227,6 +227,25 @@ fn main() {
     }
 }
 
+/// 查找回退用的 rules/ 目录：exe 同级（部署布局 A）→ exe 上级（deploy/bin 布局 B）→ cwd（源码布局 C）。
+/// 返回第一个存在的候选目录；都不存在时返回 None。
+fn find_fallback_rules_dir() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            // 布局 A：exe 与 rules/ 平级
+            candidates.push(parent.join("rules"));
+            // 布局 B：exe 在 bin/ 下，rules/ 在其上级（deploy 标准布局）
+            if let Some(grand) = parent.parent() {
+                candidates.push(grand.join("rules"));
+            }
+        }
+    }
+    // 布局 C：源码/开发场景（cwd/rules）
+    candidates.push(PathBuf::from("rules"));
+    candidates.into_iter().find(|d| d.is_dir())
+}
+
 fn load_yaml_rules(dir: &Path) -> Vec<rule_yaml::YamlRule> {
     match rule_yaml::load_rule_dir(dir) {
         Ok(r) => r,
@@ -607,19 +626,33 @@ fn run_scan(
     let builtin = rules::builtin_rules();
     let mut rule_list: Vec<Arc<dyn Rule<CompilationUnit>>> = Vec::new();
 
-    // 确定规则文件路径：CLI --rules_file > 配置文件 rules_file > 默认 javaguard.rules.toml
+    // 确定规则文件路径（解析基准分离，避免双重拼接）：
+    // - CLI --rules-file：相对当前工作目录（cwd）解析（CLI 参数惯例）
+    // - 配置文件 rules_file：相对配置文件所在目录解析
+    // - 默认 javaguard.rules.toml：相对 cwd
     let config_dir = Path::new(config_path)
         .parent()
         .unwrap_or(Path::new("."));
-    let effective_rules_file = rules_file
-        .map(|s| s.to_string())
-        .or_else(|| project_config.rules.rules_file.clone())
-        .unwrap_or_else(|| "javaguard.rules.toml".to_string());
-    let resolved_rules_file = if Path::new(&effective_rules_file).is_absolute() {
-        PathBuf::from(&effective_rules_file)
+    let resolved_rules_file = if let Some(rf) = rules_file {
+        PathBuf::from(rf)
+    } else if let Some(rf) = &project_config.rules.rules_file {
+        let pb = PathBuf::from(rf);
+        if pb.is_absolute() {
+            pb
+        } else {
+            config_dir.join(pb)
+        }
     } else {
-        config_dir.join(&effective_rules_file)
+        PathBuf::from("javaguard.rules.toml")
     };
+
+    // 规则文件不存在时显式告警（避免静默回退导致 YAML/Rhai 规则全部丢失）
+    if !resolved_rules_file.exists() {
+        eprintln!(
+            "warn: rules file not found: {}（将回退到内置规则，YAML/Rhai 规则不会被加载）",
+            resolved_rules_file.display()
+        );
+    }
 
     // 优先从 TOML 规则文件加载
     let loaded_from_toml = match load_rules_file(resolved_rules_file.to_str().unwrap_or("")) {
@@ -642,20 +675,23 @@ fn run_scan(
     };
 
     // 回退：目录扫描（向后兼容旧版 rules/ 目录结构）
+    // 注意：不能依赖 env!("CARGO_MANIFEST_DIR")（编译期源码路径，发布后用户机器上不存在），
+    // 而是从 exe 所在目录（部署布局）或 cwd（源码布局）定位 rules/。
     if !loaded_from_toml {
         for r in &builtin {
             rule_list.push(r.clone());
         }
-        let yaml_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules");
-        let yaml_rules = load_yaml_rules(&yaml_dir);
-        for yr in yaml_rules {
-            rule_list.push(Arc::new(YamlRuleAdapter::new(yr)));
-        }
-        let rhai_dir = yaml_dir.join("rhai");
-        if rhai_dir.is_dir() {
-            if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
-                for rr in rhai_rules {
-                    rule_list.push(Arc::new(RhaiRuleAdapter::new(rr)));
+        if let Some(yaml_dir) = find_fallback_rules_dir() {
+            let yaml_rules = load_yaml_rules(&yaml_dir);
+            for yr in yaml_rules {
+                rule_list.push(Arc::new(YamlRuleAdapter::new(yr)));
+            }
+            let rhai_dir = yaml_dir.join("rhai");
+            if rhai_dir.is_dir() {
+                if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
+                    for rr in rhai_rules {
+                        rule_list.push(Arc::new(RhaiRuleAdapter::new(rr)));
+                    }
                 }
             }
         }
@@ -1149,11 +1185,22 @@ fn find_parser_jar(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
         return Err(anyhow::anyhow!("parser jar not found: {p}"));
     }
 
-    let candidates = [
+    // 部署布局（exe 同级或上级 java-parser/）优先；源码布局次之；构建机源码路径最后兜底
+    let mut candidates = vec![
         PathBuf::from("java-parser/target/java-parser.jar"),
         PathBuf::from("../java-parser/target/java-parser.jar"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("java-parser/target/java-parser.jar"),
     ];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            // 布局 A：exe 与 java-parser/ 平级
+            candidates.push(parent.join("java-parser/java-parser.jar"));
+            // 布局 B：exe 在 bin/ 下，java-parser/ 在其上级（deploy 标准布局）
+            if let Some(grand) = parent.parent() {
+                candidates.push(grand.join("java-parser/java-parser.jar"));
+            }
+        }
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("java-parser/target/java-parser.jar"));
 
     for c in &candidates {
         if c.exists() {
