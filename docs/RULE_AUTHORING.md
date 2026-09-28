@@ -148,63 +148,150 @@ message: "常量（static final 字段）'{name}' 应使用 UPPER_SNAKE_CASE"
 | `{return_type}` | 方法返回类型 | `MethodDeclaration` |
 | `{field_type}` | 字段类型 | `FieldDeclaration` |
 | `{package}` | 包名 | `Import` |
+| `{member}` | 命中的注解参数取值 | `Annotation`（配合 `match_members`） |
 | `{line}` | 命中行号 | 全部 |
 
 未提供的占位符会原样保留在消息中（不会报错）。
+
+## 上下文谓词（within / not_within / in_type / in_method）
+
+`match_fields` 只能描述**节点自身**。要表达「在循环内」「在某个 Controller 里」这类
+上下文约束，用下面四个谓词 —— 它们与 `match_fields` 是 **AND** 关系：
+
+```yaml
+id: J900
+title: for-each 循环内禁止增删集合元素
+severity: major
+pattern:
+  type: MethodCall
+  match_fields:
+    method: [remove, add, clear]
+  within:                       # 命中节点必须位于下列任一 kind 的祖先之内（any_of）
+    - kind: ForEachStmt
+    - kind: WhileStmt
+  not_within:                   # 且不得位于下列任一 kind 的祖先之内（none_of）
+    - kind: CatchClause
+  in_type:                      # 且「最近的」外层类/接口/枚举必须满足
+    name: ".*Controller$"
+    annotations: [RestController]
+    is_interface: false
+  in_method:                    # 且「最近的」外层方法/构造器必须满足
+    name: "^get"
+    return_type: void
+    modifiers: [public]
+    parameter_types: ["java.util.List"]
+    parameter_names: [ids]
+message: "在 for-each 内调用 {method}() 会抛 ConcurrentModificationException"
+```
+
+语义要点：
+
+| 谓词 | 语义 | 组合方式 |
+|------|------|---------|
+| `within` | 祖先链中出现**任一**列出的 kind 即通过 | 列表内 **any_of** |
+| `not_within` | 祖先链中出现**任一**列出的 kind 即失败 | 列表内 **none_of** |
+| `in_type` | 最近的外层类型必须满足全部条件 | 各项 **AND**；`annotations` / `modifiers` 列表内 **any_of** |
+| `in_method` | 最近的外层方法/构造器必须满足全部条件 | 同上 |
+
+- `kind` 取值与 AST JSON 的 `kind` 字段一致（`ForEachStmt`、`TryStmt`、`LambdaExpr` …），
+  加载期会校验，拼错会**直接跳过该规则并告警**，不会静默失效。
+- `annotations` 无通配符时按「简单名或全限定名尾段」匹配：写 `Controller` 既能命中
+  `@Controller` 也能命中 `@org.springframework.stereotype.Controller`；`@RestController`
+  需要单独列出或用 `*Controller`。
+- `Import` 位于任何类型之外，没有上下文，因此 import 类规则写这四个谓词会在加载期报错。
+
+> 需要「同时嵌套在 A 与 B 内」这种 AND 组合时，改用 Rhai 规则。
+
+## 注解参数匹配（match_members）
+
+`AstSerializer` 会把注解参数序列化进 AST。用 `match_members` 匹配它们：
+
+```yaml
+id: J901
+title: 禁止 @ComponentScan 显式指定扫描包
+severity: major
+pattern:
+  type: Annotation
+  match_fields:
+    name: ComponentScan
+  match_members:
+    basePackages: "*"            # 带 basePackages 参数即命中
+message: "@{name}({member}) 扩大了组件扫描范围，应改用自动装配"
+```
+
+- 每个键都必须**出现在注解参数中**且取值匹配（AND）；取值匹配规则同 `match_fields`。
+- 单成员注解（`@Foo("x")`）统一记在键 `value` 下。
+- 仅 `type: Annotation` 可用；用在其它 pattern 上会在加载期报错（否则该键被忽略，
+  规则会退化成「匹配所有同类节点」并产生大量误报）。
 
 ## Rhai 脚本规则
 
 ### 脚本约定
 
 - 全局变量 `ast` 被注入为 **AST 的 JSON 对象**（与 `java-parser` 输出的 JSON 结构一致）。
+- 全局变量 `lines` / `line_count` / `source` 被注入为**源码文本**（见下节）。
 - 脚本应 **返回一个数组**，每个元素是 `{ line: int, message: string, end_line?: int }` 的 map。
 - 严重级别（severity）取自规则 YAML 的 `severity` 字段，脚本无需也不能设置。
 
+### 源码文本变量（lines / line_count / source）
+
+文本类规则（缩进、行宽、注释、换行符）需要原始源码，脚本可直接读取：
+
+| 变量 | 类型 | 含义 |
+|------|------|------|
+| `lines` | 字符串数组 | 源码行，**1-based**：`lines[i]` 即第 i 行，`lines[0]` 恒为空串哨兵 |
+| `line_count` | int | 源码**实际行数**，即遍历上界 |
+| `source` | 字符串 | 文件**全文**，保留原始换行符（可判断 `\r\n`） |
+
+⚠️ **`len(lines) == line_count + 1`**。遍历务必用 `line_count` 作上界，用 `len(lines)`
+会越界读到不存在的行。
+
 ```yaml
-# rules/rhai/J006_long_method.yml
-id: J006
-title: 方法不超过 50 行
-severity: minor
-category: code-smell
-script: |
-  let violations = [];
-  for t in ast.types {
-    for member in t.members {
-      if member.kind == "MethodDeclaration" {
-        let lines = member.end_line - member.line;
-        if lines > 50 {
-          violations.push(#{
-            line: member.line,
-            message: "方法长度 " + lines + " 行，超过 50 行限制"
-          });
-        }
-      }
+# rules/rhai/J902_line_style.rhai 的头部
+//! rule: J902
+//! title: 单行不超过 80 字符且禁止 tab 缩进
+//! severity: minor
+//! params: max_len=80
+let vs = [];
+let max_len = config["max_len"];
+if max_len == () { max_len = 80; }
+
+let i = 1;
+while i <= line_count {
+    let t = lines[i].to_string();
+    if t.contains("\t") {
+        vs.push(#{ line: i, message: "第 " + i + " 行使用了 tab 缩进" });
     }
-  }
-  violations
+    if len(t) > max_len {
+        vs.push(#{ line: i, message: "第 " + i + " 行长度 " + len(t) + " 超过限制" });
+    }
+    i = i + 1;
+}
+vs
 ```
 
-对应的 Rust 侧加载（节选自 `rule-rhai/src/engine.rs`）：
-
-```rust
-// engine.run(rule, unit, file):
-//   1. 将 unit.raw_json（或回退 JSON）转换为 Rhai Dynamic
-//   2. 注入全局变量 ast
-//   3. 执行脚本，要求返回数组
-//   4. 逐元素解析为 Violation（line / message / end_line）
-```
+- `len(t)` 数的是**字符数**（不是字节数），与「单行 ≤120 字符」的口径一致。
+- 单元测试里手工构造的 AST 不带源码，此时 `lines == [""]`、`line_count == 0`、
+  `source == ""`。文本规则应先判断 `line_count > 0` 再使用，避免误报。
 
 ### AST JSON 结构（节选）
 
 ```json
 {
   "package": "com.example",
-  "imports": [ { "package": "java.util", "isWildcard": false, "isStatic": false, "line": 3 } ],
+  "imports": [ { "package": "java.util", "is_wildcard": false, "is_static": false, "line": 3 } ],
   "types": [
     {
       "kind": "ClassDeclaration",
       "name": "UserService",
       "modifiers": ["public"],
+      "annotations": [
+        {
+          "name": "ComponentScan",
+          "line": 5,
+          "members": [ { "key": "basePackages", "value": "{ \"com.example\" }" } ]
+        }
+      ],
       "members": [
         {
           "kind": "MethodDeclaration",
@@ -224,14 +311,23 @@ script: |
 ```
 
 > 编写 Rhai 规则时，直接按上面的 JSON 字段访问即可（如 `member.kind`、`member.end_line`）。
+> 注解参数在 `annotations[].members[]`（`key` / `value`），`value` 为参数的源码字面文本。
 
 ## 规则加载与校验
 
 - 规则目录默认是 `rules/`，YAML 规则放根目录，Rhai 规则放 `rules/rhai/`。
-- 加载时会校验：
-  - `match_fields` 的字段名是否合法（见上表），未知字段会 **跳过该规则并打印警告**；
-  - `severity` 是否合法（非法则告警并降级为 `minor`）；
+  实际加载入口是 `javaguard.rules.toml` 中的 `script_path`（相对该 TOML 所在目录解析）。
+- **加载期校验**（校验失败会跳过该规则并在 stderr 打印 `warn: skip rule ...`）：
+  - `match_fields` 的字段名是否合法（见上表）；
+  - `match_members` 是否只用在 `Annotation` pattern 上；
+  - `within` / `not_within` 的 `kind` 是否是已知的 AST 节点 kind；
+  - 上下文谓词是否写在了没有上下文的 `Import` pattern 上；
+  - `severity` 是否合法（非法则跳过）；
   - Rhai 脚本是否为空。
+
+> 这些校验存在的意义：上述错误在运行期都是**静默走偏**——要么规则永不命中（隐形失效），
+> 要么失效的约束被忽略、规则退化成「匹配所有同类节点」而产生大量误报。
+
 
 ## 命令行覆盖
 

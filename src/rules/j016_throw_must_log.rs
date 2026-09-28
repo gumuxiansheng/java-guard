@@ -357,6 +357,7 @@ mod tests {
             })],
             source_file: "Test.java".to_string(),
             source_lines: vec![],
+            source_text: String::new(),
             raw_json: String::new(),
         }
     }

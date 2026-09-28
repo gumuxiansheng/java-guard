@@ -183,6 +183,7 @@ mod tests {
             })],
             source_file: make_violation_file(),
             source_lines: vec![],
+            source_text: String::new(),
             raw_json: String::new(),
         };
 
@@ -250,6 +251,7 @@ mod tests {
             })],
             source_file: make_violation_file(),
             source_lines: vec![],
+            source_text: String::new(),
             raw_json: String::new(),
         };
 

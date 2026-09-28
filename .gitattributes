@@ -1,0 +1,8 @@
+# 换行符规范
+#
+# 本机 core.autocrlf=true，文本文件会以 CRLF 检出到工作区。
+# 这对 shell 脚本是破坏性的：shebang 变成 `#!/usr/bin/env bash\r`、
+# `set -euo pipefail\r` 报 invalid option、变量赋值尾部带上 \r。
+# 因此所有 .sh 强制以 LF 入库与检出。
+
+*.sh text eol=lf

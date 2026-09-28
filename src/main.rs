@@ -365,6 +365,11 @@ fn run_rules(unit: &CompilationUnit, rule_list: &[Arc<dyn Rule<CompilationUnit>>
 }
 
 /// 解析源码（带 AST 缓存）：命中缓存直接反序列化，跳过 JVM；未命中解析后回填。
+/// 解析（带 AST 缓存），并把**源码文本**回填到编译单元。
+///
+/// 回填必须在这里做，而不是在调用点：本函数是「源码字节 → CompilationUnit」
+/// 的唯一收敛点，`check_one_file`（当前版本）与 `collect_old_violations`
+/// （`--semantic-diff` 的旧版本）都经由此处，集中回填可保证两边语义一致。
 fn parse_with_cache(
     parser: &dyn JavaParser,
     cache: &AstCache,
@@ -372,17 +377,17 @@ fn parse_with_cache(
     filename: &str,
 ) -> Result<CompilationUnit, ParseError> {
     if let Some(json) = cache.get(source) {
-        match serde_json::from_str::<CompilationUnit>(&json) {
-            Ok(mut unit) => {
-                unit.source_file = filename.to_string();
-                unit.raw_json = json;
-                return Ok(unit);
-            }
-            Err(_) => {} // 缓存损坏 → 回退到真实解析
+        if let Ok(mut unit) = serde_json::from_str::<CompilationUnit>(&json) {
+            unit.source_file = filename.to_string();
+            unit.raw_json = json;
+            unit.attach_source(source);
+            return Ok(unit);
         }
+        // 反序列化失败 = 缓存损坏 → 落到下面走真实解析
     }
-    let unit = parser.parse(source, filename)?;
+    let mut unit = parser.parse(source, filename)?;
     cache.put(source, &unit.raw_json);
+    unit.attach_source(source);
     Ok(unit)
 }
 
@@ -1382,6 +1387,20 @@ fn load_rule_from_entry(
                 }
                 yaml_rule.severity = entry.severity.clone();
                 yaml_rule.enabled = entry.enabled;
+                // 加载期校验（必须在元数据覆盖之后，才能同时校验 TOML 侧的 severity）。
+                // 未校验的错误不会报错、只会静默走偏：
+                //   - match_fields 键写错        → 规则永不命中（隐形失效）
+                //   - within/not_within 拼错 kind → 上下文约束恒不满足
+                //   - match_members 用在非注解上  → 该键被忽略，规则退化成「匹配所有同类节点」→ 大量误报
+                if let Err(bad) = yaml_rule.validate() {
+                    eprintln!(
+                        "warn: skip rule {} ({}): {}",
+                        entry.id,
+                        resolved.display(),
+                        bad.join("; ")
+                    );
+                    return None;
+                }
                 Some(Arc::new(YamlRuleAdapter::new(yaml_rule)))
             }
             Err(e) => {
@@ -1401,6 +1420,15 @@ fn load_rule_from_entry(
                 // 将 toml::Value 转为 serde_yaml::Value 传递 params
                 if let Some(ref params) = entry.params {
                     rhai_rule.params = toml_value_to_yaml(params);
+                }
+                if let Err(bad) = rhai_rule.validate() {
+                    eprintln!(
+                        "warn: skip rule {} ({}): {}",
+                        entry.id,
+                        resolved.display(),
+                        bad.join("; ")
+                    );
+                    return None;
                 }
                 Some(Arc::new(RhaiRuleAdapter::new(rhai_rule)))
             }
@@ -1880,6 +1908,118 @@ script_path = "y.yml"
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&("A.java".to_string(), 10, "J001".to_string())));
         assert!(entries.contains(&("B.java".to_string(), 3, "J009".to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 规则加载期校验 ──
+    //
+    // TOML（javaguard.rules.toml）驱动的加载路径过去**不调用** validate()，
+    // 非法规则会被照常装载：失效的约束被静默忽略，规则退化成「匹配所有同类节点」
+    // 并产生大量误报。以下两个用例锁住「非法即跳过」的行为。
+
+    fn rule_entry(id: &str, script_path: &str) -> RuleEntry {
+        RuleEntry {
+            id: id.to_string(),
+            name: id.to_lowercase(),
+            group: None,
+            description: None,
+            script_path: script_path.to_string(),
+            applies_to: vec!["java".to_string()],
+            severity: "minor".to_string(),
+            enabled: true,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn load_rule_from_entry_skips_match_members_on_non_annotation() {
+        let dir = std::env::temp_dir().join("javaguard_rule_validate_test");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let bad = dir.join("bad.yml");
+        std::fs::write(
+            &bad,
+            r#"
+id: BAD
+title: "match_members 用在 MethodCall 上"
+severity: minor
+pattern:
+  type: MethodCall
+  match_members:
+    basePackages: "*"
+message: "x"
+"#,
+        )
+        .unwrap();
+        assert!(
+            load_rule_from_entry(&rule_entry("BAD", "bad.yml"), &dir, &[]).is_none(),
+            "非法规则应被跳过，而不是带着失效配置进入扫描"
+        );
+
+        // 同一份规则换成 Annotation pattern 后应当通过
+        let good = dir.join("good.yml");
+        std::fs::write(
+            &good,
+            r#"
+id: GOOD
+title: "match_members 用在 Annotation 上"
+severity: minor
+pattern:
+  type: Annotation
+  match_fields:
+    name: ComponentScan
+  match_members:
+    basePackages: "*"
+message: "x"
+"#,
+        )
+        .unwrap();
+        assert!(load_rule_from_entry(&rule_entry("GOOD", "good.yml"), &dir, &[]).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rule_from_entry_skips_bad_ancestor_kind_and_import_context() {
+        let dir = std::env::temp_dir().join("javaguard_rule_validate_test2");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let typo = dir.join("typo.yml");
+        std::fs::write(
+            &typo,
+            r#"
+id: TYPO
+title: "祖先 kind 拼写错误"
+severity: minor
+pattern:
+  type: MethodCall
+  within:
+    - kind: ForEachStatement
+message: "x"
+"#,
+        )
+        .unwrap();
+        assert!(load_rule_from_entry(&rule_entry("TYPO", "typo.yml"), &dir, &[]).is_none());
+
+        let import_ctx = dir.join("import_ctx.yml");
+        std::fs::write(
+            &import_ctx,
+            r#"
+id: IMPCTX
+title: "import 上写上下文谓词"
+severity: minor
+pattern:
+  type: Import
+  in_type:
+    annotations: [RestController]
+message: "x"
+"#,
+        )
+        .unwrap();
+        assert!(
+            load_rule_from_entry(&rule_entry("IMPCTX", "import_ctx.yml"), &dir, &[]).is_none()
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

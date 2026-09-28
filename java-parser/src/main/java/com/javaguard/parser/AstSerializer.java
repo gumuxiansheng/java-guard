@@ -553,15 +553,50 @@ public class AstSerializer {
             .collect(Collectors.toList());
     }
 
+    /**
+     * 序列化注解，**包含注解参数**。
+     *
+     * <p>输出 {@code members} 为 {@code [{key, value}]} 数组：
+     * <ul>
+     *   <li>{@code @Foo(a = 1, b = "x")} {@code (NormalAnnotationExpr)} → 逐对展开；</li>
+     *   <li>{@code @Foo("x")} {@code (SingleMemberAnnotationExpr)} → 记为 {@code key = "value"}；</li>
+     *   <li>{@code @Foo} {@code (MarkerAnnotationExpr)} → 空数组。</li>
+     * </ul>
+     *
+     * <p>{@code value} 取表达式的字面文本（数组/字符串/常量引用均按源码形式保留），
+     * 由规则侧做字符串匹配：如 {@code @ComponentScan(basePackages = {"a", "b"})} 得到
+     * {@code {'basePackages': '{"a", "b"}'}}。
+     *
+     * <p>注意：必须保持 Java 8 语法兼容（不使用 pattern matching instanceof），
+     * 因为打包产物需要能在 JDK 8 运行时上加载。
+     */
     private List<Map<String, Object>> serializeAnnotations(NodeList<AnnotationExpr> annotations) {
         List<Map<String, Object>> result = new ArrayList<>();
         for (AnnotationExpr ann : annotations) {
             Map<String, Object> map = new LinkedHashMap<>();
             map.put("name", ann.getNameAsString());
             map.put("line", ann.getBegin().map(p -> p.line).orElse(0));
-            map.put("members", new ArrayList<>()); // MVP: 简化，不解析注解成员
+            List<Map<String, Object>> members = new ArrayList<>();
+            if (ann instanceof NormalAnnotationExpr) {
+                // @Foo(a = 1, b = "x")
+                for (MemberValuePair pair : ((NormalAnnotationExpr) ann).getPairs()) {
+                    members.add(annotationMember(pair.getNameAsString(), pair.getValue()));
+                }
+            } else if (ann instanceof SingleMemberAnnotationExpr) {
+                // @Foo("x")：单成员注解统一记为 key = "value"，与 Spring 的约定一致
+                members.add(annotationMember("value", ((SingleMemberAnnotationExpr) ann).getMemberValue()));
+            }
+            map.put("members", members);
             result.add(map);
         }
         return result;
+    }
+
+    /** 构造一个注解成员键值对，value 取表达式的字面文本。 */
+    private Map<String, Object> annotationMember(String key, Expression value) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("key", key);
+        m.put("value", value.toString());
+        return m;
     }
 }

@@ -52,15 +52,16 @@ pub fn load_rule_dir(dir: &Path) -> Result<Vec<YamlRule>, LoadError> {
             if ext == "yml" || ext == "yaml" {
                 match load_rule_file(&path) {
                     Ok(r) => {
-                        // 校验 match_fields 键是否合法，未知键会被 matcher 静默忽略，
-                        // 导致规则「隐形失效」，故在加载期直接跳过并告警。
+                        // 加载期校验：未知 match_fields 键、非法 severity、
+                        // 上下文谓词里拼错的祖先 kind 等，运行时都会**静默失效**
+                        // （规则看似生效实则从不命中），故直接跳过并告警。
                         match r.validate() {
                             Ok(()) => rules.push(r),
                             Err(bad) => eprintln!(
-                                "warn: skip rule {} ({}): unknown match_fields keys: {:?}",
+                                "warn: skip rule {} ({}): {}",
                                 r.id,
                                 path.display(),
-                                bad
+                                bad.join("; ")
                             ),
                         }
                     }

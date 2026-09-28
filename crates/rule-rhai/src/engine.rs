@@ -87,6 +87,7 @@ impl RhaiRuleEngine {
         let mut scope = Scope::new();
         scope.push("ast", ast_dynamic);
         scope.push("config", config_map);
+        push_source_vars(&mut scope, unit);
 
         let result: Dynamic = self
             .engine
@@ -97,6 +98,38 @@ impl RhaiRuleEngine {
         let violations = parse_violations(&result, &rule.id, rule.severity(), file)?;
         Ok(violations)
     }
+}
+
+/// 把源码文本注入脚本作用域（`run` 与 `run_cached` 共用）。
+///
+/// 注入三个全局变量：
+/// - `lines`：源码行数组，**1-based**（`lines[0]` 恒为空串哨兵），因此
+///   `lines[violation.line]` 可直接取到该行文本，无需手工 ±1；
+/// - `line_count`：源码**实际行数**（即最大可用下标）。
+///   ⚠️ 注意 `len(lines) == line_count + 1`，遍历务必用 `line_count`
+///   而非 `len(lines)`，否则会越界读到不存在的行；
+/// - `source`：源文件**全文**（保留原始换行符），用于判断 `\r\n`、整体 BOM 等特征。
+///
+/// 三者的数据来源都是扫描侧回填的 `CompilationUnit.source_text` / `source_lines`
+/// （见 `src/main.rs::parse_with_cache`）。单测里手工构造的 AST 未回填源码，
+/// 此时 `lines == [""]`、`line_count == 0`、`source == ""`：文本类规则应先判断
+/// `line_count > 0` 再使用，避免在无源码场景下产生误报。
+fn push_source_vars(scope: &mut Scope, unit: &CompilationUnit) {
+    let (lines, line_count) = if unit.source_lines.is_empty() {
+        // 未回填：给出「只有哨兵元素」的最小形态，规则据此可知源码不可用
+        (vec![Dynamic::from(String::new())], 0i64)
+    } else {
+        let arr: rhai::Array = unit
+            .source_lines
+            .iter()
+            .map(|l| Dynamic::from(l.clone()))
+            .collect();
+        let count = (arr.len() as i64) - 1; // 扣掉哨兵
+        (arr, count)
+    };
+    scope.push("lines", lines);
+    scope.push("line_count", line_count);
+    scope.push("source", unit.source_text.clone());
 }
 
 thread_local! {
@@ -207,6 +240,7 @@ pub fn run_cached(
                 let mut scope = Scope::new();
                 scope.push("ast", ast_dynamic);
                 scope.push("config", config_map);
+                push_source_vars(&mut scope, unit);
 
                 let result: Dynamic = engine
                     .engine
@@ -364,6 +398,7 @@ mod tests {
             })],
             source_file: "Foo.java".to_string(),
             source_lines: vec![],
+            source_text: String::new(),
             raw_json: String::new(),
         }
     }
@@ -562,5 +597,137 @@ mod tests {
         let r2 = run_cached(&rule, &unit, "Foo.java").unwrap();
         assert_eq!(r2.len(), 1);
         assert_eq!(r2[0].line, 3);
+    }
+
+    // ── P0-1：源码文本注入（lines / source）──
+
+    fn source_rule(id: &str, script: &str) -> RhaiRule {
+        RhaiRule {
+            id: id.to_string(),
+            title: "source".to_string(),
+            severity: "minor".to_string(),
+            category: "format".to_string(),
+            enabled: true,
+            params: serde_yaml::Value::Null,
+            span_policy: guard_core::rule::SpanPolicy::Anchor,
+            script: script.to_string(),
+        }
+    }
+
+    /// `lines` 为 **1-based**：`lines[1]` 即源码第 1 行，可直接用 `violation.line` 索引；
+    /// `source` 为全文。
+    #[test]
+    fn rhai_receives_lines_one_based_and_full_source() {
+        let rule = source_rule(
+            "J700",
+            r#"
+                let vs = [];
+                if line_count > 0 {
+                    vs.push(#{ line: 1, message: lines[1] });
+                    vs.push(#{ line: 2, message: lines[2] });
+                }
+                if len(source) > 0 {
+                    vs.push(#{ line: 3, message: source });
+                }
+                vs
+            "#,
+        );
+        let mut unit = make_unit();
+        unit.attach_source("alpha\nbeta\n");
+
+        let vs = run_cached(&rule, &unit, "Foo.java").unwrap();
+        assert_eq!(vs.len(), 3, "got: {vs:?}");
+        assert_eq!(vs[0].line, 1);
+        assert_eq!(vs[0].message, "alpha");
+        assert_eq!(vs[1].line, 2);
+        assert_eq!(vs[1].message, "beta");
+        assert_eq!(vs[2].message, "alpha\nbeta\n", "source 应为未切分的全文");
+    }
+
+    /// 行宽类规则只需一次遍历即可统计。
+    ///
+    /// 遍历边界必须用 `line_count`（= 实际行数）而不是 `len(lines)`：
+    /// `lines` 是 1-based 的，`len(lines) == line_count + 1`，
+    /// 用 `len(lines)` 当上界会越界。
+    #[test]
+    fn rhai_can_iterate_lines_for_text_rules() {
+        let rule = source_rule(
+            "J701",
+            r#"
+                let vs = [];
+                let i = 1;
+                while i <= line_count {
+                    let t = lines[i].to_string();
+                    if len(t) > 5 {
+                        vs.push(#{ line: i, message: "too long: " + t });
+                    }
+                    i = i + 1;
+                }
+                vs
+            "#,
+        );
+        let mut unit = make_unit();
+        unit.attach_source("short\nthis line is long\nok\n");
+
+        let vs = run_cached(&rule, &unit, "Foo.java").unwrap();
+        assert_eq!(vs.len(), 1, "got: {vs:?}");
+        assert_eq!(vs[0].line, 2);
+        assert_eq!(vs[0].message, "too long: this line is long");
+    }
+
+    /// `line_count` 与实际行数一致，且 `len(lines) == line_count + 1`。
+    #[test]
+    fn rhai_line_count_matches_source_lines() {
+        let rule = source_rule(
+            "J704",
+            r#"
+                [ #{ line: 1, message: line_count.to_string() + "/" + len(lines).to_string() } ]
+            "#,
+        );
+        let mut unit = make_unit();
+        unit.attach_source("a\nb\nc\n");
+        let vs = run_cached(&rule, &unit, "Foo.java").unwrap();
+        assert_eq!(vs[0].message, "3/4");
+    }
+
+    /// 未回填源码时（手工构造 AST / 单测），`lines` 只有哨兵元素、`source` 为空串，
+    /// 文本类规则据此可判断「源码不可用」，避免误报。
+    #[test]
+    fn rhai_without_source_sees_sentinel_only() {
+        let rule = source_rule(
+            "J702",
+            r#"
+                let vs = [];
+                if line_count == 0 && len(source) == 0 {
+                    vs.push(#{ line: 1, message: "no source available" });
+                }
+                vs
+            "#,
+        );
+        let unit = make_unit(); // 未调用 attach_source
+        let vs = run_cached(&rule, &unit, "Foo.java").unwrap();
+        assert_eq!(vs.len(), 1);
+        assert_eq!(vs[0].message, "no source available");
+    }
+
+    /// 非 ASCII 源码：`lines` 保留原始字符，`len()` 按字符计（与「单行 ≤120 字符」口径一致）。
+    #[test]
+    fn rhai_lines_keep_unicode_intact() {
+        let rule = source_rule(
+            "J703",
+            r#"
+                let vs = [];
+                if len(lines) > 1 {
+                    vs.push(#{ line: 1, message: lines[1] + "|" + len(lines[1]) });
+                }
+                vs
+            "#,
+        );
+        let mut unit = make_unit();
+        unit.attach_source("中文注释 // 说明\n");
+        let vs = run_cached(&rule, &unit, "Foo.java").unwrap();
+        assert_eq!(vs.len(), 1);
+        // "中文注释 // 说明" = 2+2+1+2+1+2 = 10 个字符（不是 22 字节）
+        assert_eq!(vs[0].message, "中文注释 // 说明|10");
     }
 }

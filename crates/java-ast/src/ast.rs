@@ -13,9 +13,38 @@ pub struct CompilationUnit {
     pub source_file: String,
     #[serde(default)]
     pub source_lines: Vec<String>,
+    /// 源文件**原始文本**（已按 encoding 解码为 UTF-8，保留原始换行符）。
+    ///
+    /// 与 `source_lines` 一样属于「扫描侧回填」字段：JavaParser 的 JSON 不产出它，
+    /// 由 `src/main.rs::check_one_file` 在解析成功后写入。
+    /// - 文本类规则（缩进 / 行宽 / 注释 / 换行符）依赖该字段；
+    /// - 声明为 `#[serde(default)]` 以兼容旧 jar（缺该键时取空串）。
+    #[serde(default)]
+    pub source_text: String,
     /// 原始 JSON 字符串（用于 Rhai 等需要原始 JSON 的场景）。
     #[serde(skip)]
     pub raw_json: String,
+}
+
+impl CompilationUnit {
+    /// 按行切分源码：兼容 `\n` 与 `\r\n`，行尾终止符被剥离。
+    ///
+    /// 返回 **1-based** 向量（`lines[0]` 恒为空串），使下标与 `Violation.line` 直接对齐，
+    /// 避免文本规则每次都要手工 ±1。
+    pub fn numbered_lines(source: &str) -> Vec<String> {
+        let mut out = Vec::with_capacity(source.lines().count() + 1);
+        out.push(String::new());
+        out.extend(source.lines().map(|l| l.to_string()));
+        out
+    }
+
+    /// 把扫描侧解码出的源码文本回填到本编译单元（幂等）。
+    pub fn attach_source(&mut self, source: &str) {
+        self.source_text = source.to_string();
+        if self.source_lines.is_empty() {
+            self.source_lines = Self::numbered_lines(source);
+        }
+    }
 }
 
 /// import 语句。
@@ -631,6 +660,7 @@ mod tests {
             })],
             source_file: "Foo.java".to_string(),
             source_lines: vec![],
+            source_text: String::new(),
             raw_json: String::new(),
         }
     }
@@ -878,5 +908,47 @@ mod tests {
         let imp: ImportDecl = serde_json::from_value(v).unwrap();
         assert!(!imp.is_wildcard);
         assert!(!imp.is_static);
+    }
+
+    // ── 源码文本回填（P0-1）──
+
+    #[test]
+    fn attach_source_populates_one_based_lines() {
+        let mut unit = sample_unit();
+        assert!(unit.source_lines.is_empty());
+
+        unit.attach_source("class A {\r\n    int x;\n}\n");
+
+        // 1-based：lines[0] 为哨兵，可直接用 violation.line 索引，免去手工 ±1
+        assert_eq!(unit.source_lines[0], "");
+        assert_eq!(unit.source_lines[1], "class A {");
+        assert_eq!(unit.source_lines[2], "    int x;");
+        assert_eq!(unit.source_lines[3], "}");
+        assert_eq!(unit.source_lines.len(), 4, "末尾空行不额外产生元素");
+
+        // 全文保留原始换行符，「Unix 换行符」类规则依赖它
+        assert!(unit.source_text.contains("\r\n"));
+    }
+
+    #[test]
+    fn attach_source_is_idempotent() {
+        let mut unit = sample_unit();
+        unit.attach_source("a\nb");
+        let first = unit.source_lines.clone();
+        unit.attach_source("a\nb");
+        assert_eq!(unit.source_lines, first);
+        assert_eq!(
+            unit.source_lines,
+            vec!["".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn numbered_lines_keeps_source_text_verbatim() {
+        let mut unit = sample_unit();
+        unit.attach_source("中文\n\t缩进\n");
+        assert_eq!(unit.source_lines[1], "中文");
+        assert_eq!(unit.source_lines[2], "\t缩进", "tab 必须原样保留，供缩进规则判定");
+        assert_eq!(unit.source_text, "中文\n\t缩进\n");
     }
 }
