@@ -1,0 +1,9 @@
+id: J103
+title: 禁止将领域模型类命名为 xxxPOJO
+severity: minor
+category: convention
+pattern:
+  type: ClassDeclaration
+  match_fields:
+    name: ".*POJO$"
+message: "类名 '{name}' 不应以 POJO 结尾——POJO 是 DO/DTO/BO/VO 的统称，应使用具体后缀（如 UserDO、UserDTO）"

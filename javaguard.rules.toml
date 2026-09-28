@@ -165,3 +165,248 @@ description = "日志必须使用门面（SLF4J），禁止直接 import 具体�
 script_path = "rules/J017_no_direct_log_impl.yml"
 severity = "warning"
 enabled = true
+
+# =============================================================================
+# 规范映射规则（J1xx 起）
+#
+# 来源：docs/CODING_STANDARD_MAPPING.md 第九章「编码规则清单与实现状态」中
+# 标注为「✅ 直接」（可基于现有引擎直接实现）的条款。
+#
+# ⚠️ 默认全部关闭（enabled = false），原因：
+#   发布包自检脚本 release/assets/scripts/verify.sh 硬断言「示例工程 7 条违规」，
+#   这批规则未经项目实测即全量启用会直接打破该基线。
+#   验证与启用方式：
+#     java-guard scan . --enable J104,J401,J501
+#   或在本文件中把对应条目的 enabled 改为 true。
+#
+# severity 按规范效力映射：【强制】→ major；【强制】但属纯风格 → minor；
+# 【参考】→ info。
+# =============================================================================
+
+# ── 命名约定（4.1）──────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J101"
+name = "class_name_no_underscore_dollar"
+group = "naming"
+description = "类名与接口名不得以 _ 或 $ 开头或结尾（规范 4.1【强制】）"
+script_path = "rules/J101_class_name_no_underscore_dollar.yml"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J103"
+name = "no_pojo_suffix"
+group = "naming"
+description = "禁止将领域模型类命名为 xxxPOJO，应使用 DO/DTO/BO/VO 具体后缀（规范 4.1【参考】）"
+script_path = "rules/J103_no_pojo_suffix.yml"
+severity = "info"
+enabled = false
+
+[[rules]]
+id = "J104"
+name = "boolean_no_is_prefix"
+group = "naming"
+description = "POJO 布尔类型字段不得加 is 前缀，避免序列化属性名解析错误（规范 4.1【强制】）"
+script_path = "rules/J104_boolean_no_is_prefix.yml"
+severity = "major"
+enabled = false
+
+# ── 代码格式与排版（4.3）────────────────────────────────────────────────────
+
+[[rules]]
+id = "J201"
+name = "max_line_length"
+group = "format"
+description = "单行字符数不超过 120（规范 4.3【强制】）"
+script_path = "rules/rhai/J201_max_line_length.rhai"
+severity = "minor"
+enabled = false
+
+[rules.params]
+max_len = 120
+
+[[rules]]
+id = "J202"
+name = "no_tab_indent"
+group = "format"
+description = "缩进必须使用 4 个空格，禁止 tab 字符（规范 4.3【强制】）"
+script_path = "rules/rhai/J202_no_tab_indent.rhai"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J203"
+name = "no_trailing_whitespace"
+group = "format"
+description = "行尾不得有多余空白字符（规范 4.3）"
+script_path = "rules/rhai/J203_no_trailing_whitespace.rhai"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J204"
+name = "unix_line_ending"
+group = "format"
+description = "源文件必须使用 Unix 换行符 LF，不得使用 CRLF（规范 4.3【强制】）"
+script_path = "rules/rhai/J204_unix_line_ending.rhai"
+severity = "minor"
+enabled = false
+
+# ── OOP 与类型使用（4.4）────────────────────────────────────────────────────
+
+[[rules]]
+id = "J301"
+name = "no_bigdecimal_double"
+group = "oop"
+description = "禁止用 new BigDecimal(double) 构造，存在精度损失（规范 4.4【强制】）"
+script_path = "rules/rhai/J301_no_bigdecimal_double.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J302"
+name = "pojo_no_default_value"
+group = "oop"
+description = "POJO 类属性不得设置默认值（规范 4.4【强制】）"
+script_path = "rules/rhai/J302_pojo_no_default_value.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J303"
+name = "pojo_must_tostring"
+group = "oop"
+description = "POJO 类必须实现 toString（规范 4.4【强制】）"
+script_path = "rules/rhai/J303_pojo_must_tostring.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J304"
+name = "equals_hashcode_pair"
+group = "oop"
+description = "重写 equals 必须同时重写 hashCode（规范 4.5【强制】）"
+script_path = "rules/rhai/J304_equals_hashcode_pair.rhai"
+severity = "major"
+enabled = false
+
+# ── 集合处理（4.5）──────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J401"
+name = "no_collection_modify_in_foreach"
+group = "collection"
+description = "for-each 循环内禁止对集合做增删，会触发 ConcurrentModificationException（规范 4.5【强制】）"
+script_path = "rules/J401_no_collection_modify_in_foreach.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J402"
+name = "toarray_with_typed_array"
+group = "collection"
+description = "集合转数组必须使用 toArray(T[] array)（规范 4.5【强制】）"
+script_path = "rules/rhai/J402_toarray_with_typed_array.rhai"
+severity = "major"
+enabled = false
+
+# ── 并发与线程安全（4.6）────────────────────────────────────────────────────
+
+[[rules]]
+id = "J501"
+name = "no_executors_thread_pool"
+group = "concurrency"
+description = "禁止用 Executors 创建线程池（队列/线程数无界易 OOM），须用 ThreadPoolExecutor（规范 4.6【强制】）"
+script_path = "rules/J501_no_executors_thread_pool.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J502"
+name = "no_static_dateformat"
+group = "concurrency"
+description = "SimpleDateFormat 等非线程安全 Format 不得定义为 static 变量（规范 4.6【强制】）"
+script_path = "rules/J502_no_static_dateformat.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J503"
+name = "no_new_thread"
+group = "concurrency"
+description = "禁止显式 new Thread()，线程资源必须通过线程池提供（规范 4.6【强制】）"
+script_path = "rules/rhai/J503_no_new_thread.rhai"
+severity = "major"
+enabled = false
+
+# ── 控制语句（4.7）──────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J510"
+name = "switch_must_have_default"
+group = "control"
+description = "switch 语句必须包含 default 分支（规范 4.7【强制】）"
+script_path = "rules/rhai/J510_switch_must_have_default.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J511"
+name = "require_braces"
+group = "control"
+description = "if / 循环语句必须使用大括号，即使只有一行代码（规范 4.7【强制】）"
+script_path = "rules/rhai/J511_require_braces.rhai"
+severity = "minor"
+enabled = false
+
+# ── 异常处理（5）────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J601"
+name = "no_return_in_finally"
+group = "exception"
+description = "finally 块中禁止 return，会覆盖 try/catch 返回值并吞掉异常（规范 5【强制】）"
+script_path = "rules/rhai/J601_no_return_in_finally.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J602"
+name = "no_generic_exception"
+group = "exception"
+description = "禁止直接创建/抛出 RuntimeException、Exception、Throwable，应使用业务自定义异常（规范 5【强制】）"
+script_path = "rules/rhai/J602_no_generic_exception.rhai"
+severity = "major"
+enabled = false
+
+# ── 日志规约（4.10）─────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J610"
+name = "log_must_use_placeholder"
+group = "logging"
+description = "日志输出必须使用占位符 {} 而非字符串拼接（规范 4.10【强制】）"
+script_path = "rules/rhai/J610_log_must_use_placeholder.rhai"
+severity = "minor"
+enabled = false
+
+# ── Spring Boot 专项（13）───────────────────────────────────────────────────
+
+[[rules]]
+id = "J701"
+name = "no_componentscan_basepackages"
+group = "spring"
+description = "禁止 @ComponentScan 显式指定 basePackages 扩大扫描范围（规范 13.1）"
+script_path = "rules/J701_no_componentscan_basepackages.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J702"
+name = "no_scanbasepackages"
+group = "spring"
+description = "禁止 @SpringBootApplication 显式指定 scanBasePackages 扩大扫描范围（规范 13.1）"
+script_path = "rules/J702_no_scanbasepackages.yml"
+severity = "major"
+enabled = false

@@ -1,0 +1,10 @@
+id: J502
+title: 禁止将 SimpleDateFormat 等 Format 子类定义为 static 变量
+severity: major
+category: concurrency
+pattern:
+  type: FieldDeclaration
+  match_fields:
+    field_type: "*SimpleDateFormat*"
+    modifier: static
+message: "字段 '{name}'（{field_type}）是非线程安全的 Format 子类，定义为 static 共享变量会导致并发解析出错；请改为局部变量、加锁，或使用 DateTimeFormatter / DateUtils"

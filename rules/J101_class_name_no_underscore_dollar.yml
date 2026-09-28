@@ -1,0 +1,9 @@
+id: J101
+title: 类名与接口名不得以下划线或美元符号开头或结尾
+severity: minor
+category: convention
+pattern:
+  type: ClassDeclaration
+  match_fields:
+    name: "^[_$].*|.*[_$]$"
+message: "类名 '{name}' 不得以下划线（_）或美元符号（$）开头或结尾"

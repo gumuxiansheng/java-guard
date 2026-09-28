@@ -1,0 +1,11 @@
+id: J401
+title: for-each 循环内禁止对集合做增删操作
+severity: major
+category: bug
+pattern:
+  type: MethodCall
+  match_fields:
+    method: [remove, add, clear, removeAll, retainAll, addAll]
+  within:
+    - kind: ForEachStmt
+message: "在 for-each 内调用 {method}() 会触发 ConcurrentModificationException；请改用 Iterator.remove() 或先收集待删元素再统一处理"

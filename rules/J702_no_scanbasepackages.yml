@@ -1,0 +1,11 @@
+id: J702
+title: 禁止 @SpringBootApplication 显式指定 scanBasePackages
+severity: major
+category: spring
+pattern:
+  type: Annotation
+  match_fields:
+    name: SpringBootApplication
+  match_members:
+    scanBasePackages: "*"
+message: "@{name}({member}) 显式声明了扫描包，会扩大组件扫描范围；默认扫描主类所在包及其子包即可，跨包能力请通过自动装配提供"

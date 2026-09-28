@@ -372,7 +372,12 @@ public class AstSerializer {
         if (expr instanceof MethodCallExpr) {
             MethodCallExpr mce = (MethodCallExpr) expr;
             map.put("kind", "MethodCallExpr");
+            // callee 保持为字符串（与现有规则契约一致：Scope 的简单名或原始文本）。
+            // scope 额外给出序列化后的调用者节点（map 或 null），用于穿透
+            // `new Thread(...).start()` 这类「对象创建作为方法调用 scope」的形态——
+            // 否则 scope 被 exprToString 压成原始文本，Thread 这个 ObjectCreationExpr 会丢失。
             map.put("callee", mce.getScope().map(this::exprToString).orElse(null));
+            map.put("scope", mce.getScope().map(this::serializeExpr).orElse(null));
             map.put("method_name", mce.getNameAsString());
             List<Map<String, Object>> args = new ArrayList<>();
             for (Expression arg : mce.getArguments()) {

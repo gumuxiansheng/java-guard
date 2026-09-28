@@ -14,7 +14,7 @@
 | **P0-2 注解参数序列化** | ✅ 已实施 | `AstSerializer.serializeAnnotations` 解析 `NormalAnnotationExpr` / `SingleMemberAnnotationExpr` / `MarkerAnnotationExpr`，产出 `members[{key,value}]`；YAML 侧新增 `match_members` 谓词可直接匹配注解参数 |
 | **P0-3 YAML 上下文谓词 + AST 统一遍历** | ✅ 已实施 | `crates/rule-yaml/src/matcher.rs` 重写为「一次遍历 + 统一字段匹配」；新增 `within` / `not_within` / `in_type` / `in_method`；附带修复了三处既有遍历盲区（字段初始化器、静态初始化块、lambda 体） |
 | 附带修复：加载期校验接入真实路径 | ✅ 已实施 | `load_rule_from_entry`（TOML 驱动的实际加载入口）此前**从不调用** `validate()`，非法规则会静默走偏并误报；现已接入 |
-| P1 批量补规则 | ⏳ 待实施 | 见第五章 P1 与附录 B |
+| P1 批量补规则（第一批 23 条） | ✅ 已实施 | 23 条「✅ 直接」条款已落地为规则（详见第十章），默认 `enabled=false` 不冲击基线；`--enable` 可单独激活 |
 | P2 跨文件 / 非 Java 文件 | ⏳ 待实施 | `ProjectRule` + 激活死配置 `applies_to` |
 | P3 数据流公共库 / 抑制机制 | ⏳ 待实施 | `guard_core::dataflow`、`// noqa` |
 
@@ -574,6 +574,402 @@ enabled = true
 
 ---
 
+## 九、编码规则清单与实现状态
+
+按第二章的 20 个主题分组，**组内编号沿用「主题号.序号」**，并保留规范出处章节号。
+
+**状态图例**：
+
+| 标记 | 含义 |
+|---|---|
+| ✅ **直接** | 可基于现有引擎直接实现（YAML 规则 / Rhai 脚本，无需改 Rust 或 Java 侧代码） |
+| 🔧 **改造** | 需改造现有引擎（新增 PatternKind / AST 字段 / 非 Java 文件通道 / 跨文件能力） |
+| ⛔ **暂不可** | 暂无法实现（需跨文件类型解析、运行期信息、配置契约或语义理解） |
+
+> 落地进度见每条规则下的「实现」子行；未落地的可直接实现项标注为「待实现」。
+
+### 9.1 命名约定（4.1）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 1.1 | 命名禁以 `_` / `$` 开头或结尾 | 4.1 | 强制 | ✅ 已落地 | 类名/方法名/字段名正则（→ J101） |
+| 1.2 | 命名严禁拼音与英文混合、禁止中文 | 4.1 | 强制 | ⛔ 暂不可 | 需词典与语义判断，静态无法判定 |
+| 1.3 | 类名与接口名 UpperCamelCase | 4.1 | 强制 | ✅ 直接 | 已有 **J004** |
+| 1.4 | 方法名 / 参数名 / 成员变量 / 局部变量 lowerCamelCase | 4.1 | 强制 | ✅ 直接 | 方法名已有 **J005**；局部变量在 AST 中为 `VariableDeclarationStmt`，可补 |
+| 1.5 | 常量名 UPPER_SNAKE_CASE | 4.1 | 强制 | ✅ 直接 | 已有 **J007** |
+| 1.6 | 抽象类以 `Abstract` / `Base` 开头 | 4.1 | 强制 | ✅ 直接 | 类名正则 + `modifier: abstract` |
+| 1.7 | 异常类以 `Exception` 结尾 | 4.1 | 强制 | ✅ 直接 | 类名正则 |
+| 1.8 | 测试类以被测试类名开头、`Test` 结尾 | 4.1 | 强制 | ✅ 直接 | 类名正则（启发式，含 `Test` 后缀且非 `Test` 本身） |
+| 1.9 | 数组声明用 `String[] args` 而非 `String args[]` | 4.1 | 强制 | ✅ 直接 | 需扫描参数/局部变量的 `var_type` 中 `[]` 位置 |
+| 1.10 | POJO 布尔类型变量禁加 `is` 前缀 | 4.1 | 强制 | ✅ 已落地 | `field_type` ∈ {`boolean`,`Boolean`} + `name` 以 `is` 开头（→ J104） |
+| 1.11 | 包名统一小写、单数形式 | 4.1 | 强制 | ✅ 直接 | `ast.package` 段判定 |
+| 1.12 | 杜绝不规范缩写 | 4.1 | 强制 | ⛔ 暂不可 | 「望文不知义」是主观判断 |
+| 1.13 | 使用设计模式时类名体现模式 | 4.1 | 推荐 | ⛔ 暂不可 | 需语义识别 |
+| 1.14 | 接口中的方法与属性不加修饰符 | 4.1 | 推荐 | ✅ 直接 | 接口成员 `modifiers` 非空即违规 |
+| 1.15 | Service / DAO 暴露接口，实现类以 `Impl` 结尾 | 4.1 | 强制 | 🔧 改造 | 「接口是否有对应 Impl」需跨文件；类名后缀本身可直接判定 |
+| 1.16 | 能力型接口名用 `-able` 形容词 | 4.1 | 推荐 | ⛔ 暂不可 | 语义判断 |
+| 1.17 | 枚举类名带 `Enum` 后缀 | 4.1 | 参考 | ✅ 直接 | `EnumDeclaration.name` 正则 |
+| 1.18 | 枚举成员全大写、下划线分隔 | 4.1 | 参考 | ✅ 直接 | `EnumDeclaration.constants[].name` 正则 |
+| 1.19 | 父子成员变量 / 同方法不同块局部变量禁同名 | 4.1 | 强制 | 🔧 改造 | 同文件「不同块同名」可做，父子同名需跨文件 |
+| 1.20 | 表示类型的名词置于词尾（`startTime` / `nameList`） | 4.1 | 推荐 | ⛔ 暂不可 | 语义判断 |
+| 1.21 | Service/DAO 方法前缀 `get`/`list`/`count`/`save`/`remove`/`update` 等 | 4.1 | 参考 | ✅ 直接 | 类名以 `Service`/`DAO`/`Mapper` 结尾 + 方法名前缀白名单 |
+| 1.22 | 领域模型后缀 `DO` / `DTO` / `BO` / `VO`，禁 `POJO` | 4.1 | 参考 | ✅ 已落地 | 类名后缀判定（→ J103） |
+| 1.23 | Java 文件名与顶层类名一致 | 4.1 | 强制 | ✅ 直接 | `source_file` 去扩展名 vs `types[0].name` |
+| 1.24 | JSP / HTML / XML 等文件使用小写文件名 | 4.1 | 强制 | 🔧 改造 | 需非 Java 文件通道（P2-1） |
+| 1.25 | Maven 坐标长度受控（jar 名 ≤64 字符） | 4.1 | 强制 | 🔧 改造 | 需 `pom.xml` 通道（P2-1） |
+
+### 9.2 常量与魔法值（4.2）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 2.1 | 禁止魔法值直接出现在代码中 | 4.2 | 强制 | ✅ 直接 | 字符串/数字字面量直接作为实参或赋值（需白名单，`0`/`1`/`-1`/`""` 等放行） |
+| 2.2 | `long` / `Long` 赋值必须用大写 `L` | 4.2 | 强制 | ✅ 直接 | `LiteralExpr.value` 以 `l` 结尾 |
+| 2.3 | 常量按功能归类，禁「大而全」常量类 | 4.2 | 推荐 | ⛔ 暂不可 | 需按业务语义划分 |
+| 2.4 | 常量复用分五层（跨应用 / 应用内 / 子工程 / 包内 / 类内） | 4.2 | 推荐 | ⛔ 暂不可 | 架构约定，静态不可判定 |
+| 2.5 | 值域有限或带延伸属性必须用 `Enum` | 4.2 | 推荐 | ⛔ 暂不可 | 语义判断 |
+
+### 9.3 代码格式与排版（4.3）
+
+> 4.3 为**文本类**规范，P0-1 后 Rhai 已可读 `lines` / `source`。但**纯文本正则无法区分代码与字符串字面量、注释内容**，
+> 因此下面按「误报风险」分别标注：结构性、误报低的项标 ✅；需精确到 token 位置的项标 🔧。
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 3.1 | 缩进使用 4 个空格，禁用 tab | 4.3 | 强制 | ✅ 已落地 | 行首字符为 `\t`（→ J202） |
+| 3.2 | 单行字符数不超过 120 | 4.3 | 强制 | ✅ 已落地 | `len(lines[i]) > 120`（→ J201） |
+| 3.3 | 源文件使用 Unix 换行符（`\n`） | 4.3 | 强制 | ✅ 已落地 | `source.contains("\r\n")`（→ J204） |
+| 3.4 | 行尾无多余空白 | 4.3 | 强制 | ✅ 已落地 | 行尾为空格/tab（→ J203） |
+| 3.5 | 单个方法总行数不超过 80 | 4.3 | 推荐 | ✅ 直接 | `end_line - line`；AST 已有，无需文本 |
+| 3.6 | 源文件使用 UTF-8 无 BOM | 4.3 | 强制 | 🔧 改造 | BOM 在 `decode_source_bytes` 阶段已剥离，需额外记录标记 |
+| 3.7 | 大括号四则（左括号前不换行 / 左后换行 / 右前换行 / 右后有 else 不换行） | 4.3 | 强制 | 🔧 改造 | 需精确到 token 位置，纯文本正则易被字符串/注释干扰 |
+| 3.8 | `if` / `for` / `while` / `switch` / `do` 与括号间加空格 | 4.3 | 强制 | 🔧 改造 | 同上，需 token 级信息 |
+| 3.9 | 运算符左右各加一个空格 | 4.3 | 强制 | 🔧 改造 | 同上 |
+| 3.10 | `//` 注释双斜线后加且仅加一个空格 | 4.3 | 强制 | 🔧 改造 | 需区分注释与代码（如 URL 中的 `//`） |
+| 3.11 | 方法参数逗号后加空格 | 4.3 | 强制 | 🔧 改造 | 同上 |
+| 3.12 | 强制类型转换右括号与值之间无空格 | 4.3 | 强制 | 🔧 改造 | 同上 |
+| 3.13 | 不使用空格对齐上一行字符 | 4.3 | 推荐 | 🔧 改造 | 同上 |
+| 3.14 | 源文件中除行结束符外只允许 ASCII 空格 (0x20) | 4.3 | 强制 | 🔧 改造 | 需区分字符串/注释内的空白 |
+| 3.15 | 语义块之间插入一个空行 | 4.3 | 推荐 | ⛔ 暂不可 | 「语义」划分无法静态判定 |
+| 3.16 | 一元运算符与操作数之间不加空格 | 4.3 | 强制 | 🔧 改造 | 需 token 级信息 |
+| 3.17 | 发布前删除调试代码与断言 | 4.3 | 强制 | ✅ 直接 | `System.out.print*` / `printStackTrace` / `System.err`（J001 已覆盖部分） |
+
+### 9.4 OOP 与类型使用（4.4）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 4.1 | 用类名访问静态成员，不用对象引用 | 4.4 | 强制 | ⛔ 暂不可 | 需类型解析判断「成员是否静态」 |
+| 4.2 | 覆写方法必须加 `@Override` | 4.4 | 强制 | 🔧 改造 | 需父类/接口签名；**建议直接用 `javac -Xlint:overrides`** |
+| 4.3 | 可变参数必须置于参数列表最后 | 4.4 | 强制 | ✅ 直接 | 参数 `param_type` 含 `...` 且非末位 |
+| 4.4 | 外部接口禁改签名，过时须加 `@Deprecated` | 4.4 | 强制 | ⛔ 暂不可 | 「是否被外部依赖」需跨工程 |
+| 4.5 | `equals` 调用常量在前（`"x".equals(o)`） | 4.4 | 强制 | ✅ 直接 | `MethodCallExpr.method == "equals"` 且 `callee` 为字符串字面量（含引号） |
+| 4.6 | 包装类对象比较用 `equals` 而非 `==` | 4.4 | 强制 | ⛔ 暂不可 | 需类型推断；建议 SpotBugs |
+| 4.7 | 浮点数禁用 `==` / `equals` 比较 | 4.4 | 强制 | ⛔ 暂不可 | 需类型推断；建议 SpotBugs |
+| 4.8 | DO 属性类型与数据库字段类型匹配 | 4.4 | 强制 | ⛔ 暂不可 | 需数据库 schema |
+| 4.9 | 禁止 `new BigDecimal(double)` | 4.4 | 强制 | ✅ 已落地 | `ObjectCreationExpr.class_name == "BigDecimal"` + 实参为浮点字面量（→ J301） |
+| 4.10 | POJO 属性使用包装数据类型 | 4.4 | 强制 | ✅ 直接 | 类名 `DO/DTO/BO/VO` 后缀 + 字段类型为基本类型 |
+| 4.11 | RPC 方法返回值与参数使用包装类型 | 4.4 | 强制 | ⛔ 暂不可 | 「是否 RPC 方法」需识别远程调用约定 |
+| 4.12 | 局部变量使用基本数据类型 | 4.4 | 推荐 | ✅ 直接 | 局部变量声明类型为包装类（启发式，误报偏高） |
+| 4.13 | POJO 属性不设默认值 | 4.4 | 强制 | ✅ 已落地 | 类名 POJO 后缀 + `FieldDeclaration.initializer != null`（→ J302） |
+| 4.14 | `serialVersionUID` 不随意修改 | 4.4 | 强制 | ⛔ 暂不可 | 需与历史版本对比；「字段存在性」可直接判定 |
+| 4.15 | 构造器禁止加入业务逻辑 | 4.4 | 强制 | ✅ 直接 | `ConstructorDeclaration` 方法体语句数超阈值（启发式） |
+| 4.16 | POJO 必须实现 `toString` | 4.4 | 强制 | ✅ 已落地 | 类名 POJO 后缀 + 成员无 `toString`（→ J303） |
+| 4.17 | 禁止 `isXxx()` 与 `getXxx()` 并存 | 4.4 | 强制 | ✅ 直接 | 类内方法名集合比对 |
+| 4.18 | `String.split` 结果按下标访问前需检查长度 | 4.4 | 推荐 | 🔧 改造 | 需数据流（数组长度检查） |
+| 4.19 | 多个构造器 / 同名方法应放在一起 | 4.4 | 推荐 | ✅ 直接 | 同名方法声明行号不连续（启发式） |
+| 4.20 | 类内方法顺序：公有 > 私有 > getter/setter | 4.4 | 推荐 | ✅ 直接 | 按 `modifiers` 顺序判定（启发式，误报偏高） |
+| 4.21 | setter 参数名与成员名一致，且不含业务逻辑 | 4.4 | 推荐 | ✅ 直接 | `setXxx` 参数名 vs 成员名 |
+| 4.22 | 循环体内字符串拼接使用 `StringBuilder` | 4.4 | 推荐 | ✅ 直接 | 循环体内字符串 `+` 赋值 |
+| 4.23 | `final` 的正确使用（禁重新赋值等 5 种场景） | 4.4 | 推荐 | 🔧 改造 | 需数据流判断「是否被重新赋值」 |
+| 4.24 | 慎用 `Object.clone` | 4.4 | 推荐 | ✅ 直接 | `MethodCallExpr.method == "clone"` |
+| 4.25 | 访问控制从严（8 条细则：工具类构造器 private、非 static 成员 private 等） | 4.4 | 推荐 | ✅ 直接 | 字段/方法 `modifiers` 判定（部分细则需区分「是否被外部使用」→ 暂不可） |
+
+### 9.5 集合处理（4.5）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 5.1 | 重写 `equals` 必须同时重写 `hashCode` | 4.5 | 强制 | ✅ 已落地 | 类内方法名集合比对（→ J304） |
+| 5.2 | `subList` 结果不可强转为 `ArrayList` | 4.5 | 强制 | ✅ 直接 | `CastExpr.cast_type == "ArrayList"` 且被转换表达式含 `subList` |
+| 5.3 | `keySet` / `values` / `entrySet` 返回集合禁止增删 | 4.5 | 强制 | ✅ 直接 | 链式调用：`callee` 含 `keySet()`/`values()`/`entrySet()` 后接 `add`/`remove` |
+| 5.4 | `Collections.emptyList()` 等不可变集合禁止增删 | 4.5 | 强制 | ✅ 直接 | `callee == "Collections"` 创建后接增删 |
+| 5.5 | `subList` 期间修改原集合会触发 CME | 4.5 | 强制 | 🔧 改造 | 需数据流判断「原集合是否被改动」 |
+| 5.6 | 集合转数组必须用 `toArray(T[] array)` | 4.5 | 强制 | ✅ 已落地 | `method == "toArray"` 且 `arguments` 为空（→ J402） |
+| 5.7 | `addAll()` 入参需判空 | 4.5 | 强制 | 🔧 改造 | 需数据流（前置判空） |
+| 5.8 | `Arrays.asList()` 返回集合禁止增删 | 4.5 | 强制 | ✅ 直接 | `callee == "Arrays"` + `method == "asList"` 后接增删 |
+| 5.9 | `<? extends T>` 禁 add、`<? super T>` 禁 get（PECS） | 4.5 | 强制 | ⛔ 暂不可 | 需泛型类型解析 |
+| 5.10 | 非泛型集合赋值给泛型集合时需 `instanceof` 判断 | 4.5 | 强制 | ⛔ 暂不可 | 需类型解析 |
+| 5.11 | foreach 循环内禁止 `remove` / `add` | 4.5 | 强制 | ✅ 已落地 | `within: [ForEachStmt]` + 方法名白名单（P0-3 后 YAML 可直接写）（→ J401） |
+| 5.12 | `Comparator` 需满足自反 / 传递 / 对称三条件 | 4.5 | 强制 | ⛔ 暂不可 | 需语义与数学性质验证 |
+| 5.13 | 集合初始化使用 diamond 语法 `<>` | 4.5 | 推荐 | ⛔ 暂不可 | AST 不保留 `new` 处的泛型实参 |
+| 5.14 | 集合初始化时指定初始容量 | 4.5 | 推荐 | ✅ 直接 | `ObjectCreationExpr` 为集合类型且 `arguments` 为空（弱） |
+| 5.15 | 遍历 Map 使用 `entrySet` 而非 `keySet` | 4.5 | 推荐 | ✅ 直接 | foreach 的 `iterable` 含 `keySet()` |
+| 5.16 | 注意 Map 实现是否允许 null 键/值 | 4.5 | 推荐 | ⛔ 暂不可 | 需类型解析 |
+| 5.17 | 利用集合有序性 / 稳定性 | 4.5 | 参考 | ⛔ 暂不可 | 语义判断 |
+| 5.18 | 用 Set 去重而非 `List.contains` 遍历 | 4.5 | 参考 | ⛔ 暂不可 | 语义判断 |
+| 5.19 | 空判断使用 `StringUtils.isEmpty` / `isBlank` | 4.5 | 参考 | ✅ 直接 | `x == null \|\| x.isEmpty()` 形态（弱） |
+
+### 9.6 并发与线程安全（4.6）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 6.1 | 单例对象及其方法必须线程安全 | 4.6 | 强制 | ⛔ 暂不可 | 需共享状态分析 |
+| 6.2 | 创建线程时必须指定有意义名称 | 4.6 | 强制 | ✅ 直接 | `new Thread(...)` 命名参数为空 |
+| 6.3 | 线程资源必须通过线程池提供，禁止显式 `new Thread` | 4.6 | 强制 | ✅ 已落地 | `ObjectCreationExpr.class_name == "Thread"`（→ J503） |
+| 6.4 | 禁止每次请求 / 会话新建线程池 | 4.6 | 强制 | ⛔ 暂不可 | 需判断创建位置的作用域 |
+| 6.5 | 禁止用 `Executors` 创建线程池，须用 `ThreadPoolExecutor` | 4.6 | 强制 | ✅ 已落地 | `MethodCallExpr.callee == "Executors"`（→ J501） |
+| 6.6 | `SimpleDateFormat` 等 Format 子类不得定义为 `static` 变量 | 4.6 | 强制 | ✅ 已落地 | `FieldDeclaration.field_type` 含 `SimpleDateFormat` + `modifier: static`（→ J502） |
+| 6.7 | 自定义 `ThreadLocal` 变量必须回收（`remove`） | 4.6 | 强制 | ✅ 直接 | 声明了 `ThreadLocal` 但全文无 `.remove()`（弱，启发式） |
+| 6.8 | `ThreadLocal` 宜用 `static` 修饰 | 4.6 | 强制 | ✅ 直接 | `ThreadLocal` 字段非 `static` |
+| 6.9 | 加锁粒度尽可能小，不在锁内调用 RPC | 4.6 | 强制 | ⛔ 暂不可 | 需识别 RPC 调用与锁作用域 |
+| 6.10 | 多资源加锁顺序保持一致 | 4.6 | 强制 | ⛔ 暂不可 | 需跨方法锁序分析 |
+| 6.11 | 加解锁必须成对，异常场景也要解锁 | 4.6 | 强制 | 🔧 改造 | 需数据流 / 分支可达性 |
+| 6.12 | `lock()` 必须在 `try` 代码块**之外** | 4.6 | 强制 | ✅ 直接 | `TryStmt.try_body` 首条语句为 `lock()` 调用 |
+| 6.13 | `tryLock` 进入业务代码前先判断是否持有锁 | 4.6 | 强制 | ✅ 直接 | `tryLock` 结果未参与条件判断（弱） |
+| 6.14 | 并发修改同一记录需加锁或用 `version` 乐观锁 | 4.6 | 强制 | ⛔ 暂不可 | 需识别共享数据访问 |
+| 6.15 | 定时任务用 `ScheduledExecutorService` 而非 `Timer` | 4.6 | 强制 | ✅ 直接 | `ObjectCreationExpr.class_name == "Timer"` |
+| 6.16 | 资金等金融敏感信息使用悲观锁 | 4.6 | 推荐 | ⛔ 暂不可 | 语义判断 |
+| 6.17 | `CountDownLatch` 必须调用 `countDown` | 4.6 | 推荐 | ✅ 直接 | 声明了 latch 但无 `countDown()`（弱） |
+| 6.18 | 避免多线程共享 `Random` 实例 | 4.6 | 推荐 | ✅ 直接 | `static` `Random` 字段（弱） |
+| 6.19 | 双重检查锁（DCL）延迟初始化隐患 | 4.6 | 推荐 | ✅ 直接 | 同步块内外双重 null 检查模式 |
+| 6.20 | `volatile` 仅适用于一写多读 | 4.6 | 推荐 | ⛔ 暂不可 | 需访问模式分析 |
+| 6.21 | `HashMap` 并发 resize 可能死链 | 4.6 | 推荐 | ⛔ 暂不可 | 需判断并发访问 |
+| 6.22 | `ArrayList` / `HashMap` / `HashSet` / `StringBuilder` 禁止并发混合操作 | 4.6 | 强制 | ⛔ 暂不可 | 需判断线程边界 |
+
+### 9.7 控制语句（4.7）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 7.1 | `switch` 每个 case 必须以 `break` / `return` 结束或注释说明 | 4.7 | 强制 | ✅ 直接 | `cases[].statements` 末条不是 `break`/`return`/`throw`/`continue` |
+| 7.2 | `switch` 必须包含 `default` | 4.7 | 强制 | ✅ 已落地 | `SwitchStmt.cases` 中存在 `label == null`（→ J510） |
+| 7.3 | `String` 类型的 `switch` 变量必须先判 null | 4.7 | 强制 | 🔧 改造 | 需数据流（前置判空） |
+| 7.4 | `if` / `else` / `for` / `while` / `do` 必须使用大括号 | 4.7 | 强制 | ✅ 已落地 | 分支 / 循环体非 `BlockStmt`（→ J511） |
+| 7.5 | 高并发场景禁用「等于」作为中断 / 退出条件 | 4.7 | 强制 | ⛔ 暂不可 | 需识别并发场景 |
+| 7.6 | `if-else` 嵌套不超过 3 层 | 4.7 | 强制 | ✅ 直接 | 统计 `IfStmt` 嵌套深度 |
+| 7.7 | 复杂条件提取为有意义的布尔变量 | 4.7 | 推荐 | ⛔ 暂不可 | 「复杂」为主观判断 |
+| 7.8 | 禁止在条件表达式中赋值 | 4.7 | 推荐 | ✅ 直接 | condition 内出现 `AssignExpr` |
+| 7.9 | 循环体内的对象定义 / 连接获取移至循环外 | 4.7 | 推荐 | ✅ 直接 | 循环体内出现 `ObjectCreationExpr`（弱） |
+| 7.10 | 避免取反逻辑运算符 | 4.7 | 推荐 | ✅ 直接 | `UnaryExpr.op == "!"`（误报偏高，建议 `info`） |
+| 7.11 | 接口入参保护（批量操作接口限制规模） | 4.7 | 推荐 | ⛔ 暂不可 | 需识别接口边界与规模约束 |
+| 7.12 | 判断语句中常量写在左边（`CONST.equals(x)`） | 4.7 | 强制 | ✅ 直接 | `equals` 的 `callee` 为字符串字面量 |
+
+### 9.8 注释与文档（4.8）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 8.1 | 类 / 类属性 / 类方法注释必须用 Javadoc `/** */`，不得用 `//` | 4.8 | 强制 | ✅ 直接 | 结合 AST 行号与 `lines`：声明行上方注释形态 |
+| 8.2 | 抽象方法（含接口方法）必须写 Javadoc | 4.8 | 强制 | ✅ 直接 | 同上，限定接口 / 抽象成员 |
+| 8.3 | 类注释须包含作者 / 变更人 / 复核人 / 日期 | 4.8 | 强制 | ✅ 直接 | 文本匹配（**真实性无法校验**，属流程治理） |
+| 8.4 | 方法内单行注释在被注释语句上方另起一行 | 4.8 | 强制 | 🔧 改造 | 需 token 位置 |
+| 8.5 | 枚举类型字段必须有注释说明用途 | 4.8 | 强制 | ✅ 直接 | `EnumConstant` 行上方是否有注释 |
+| 8.6 | 注释语言：中文优先，专有名词保留英文 | 4.8 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 8.7 | 代码修改时同步修改注释 | 4.8 | 强制 | ⛔ 暂不可 | 需语义一致性判断 |
+| 8.8 | 注释掉的代码须配说明或删除 | 4.8 | 强制 | ✅ 直接 | 注释块内含代码特征（弱） |
+| 8.9 | 注释应准确反映设计思想，避免过滥 | 4.8 | 强制 | ⛔ 暂不可 | 主观判断 |
+| 8.10 | `TODO` / `FIXME` 必须标注标记人与时间 | 4.8 | 强制 | ✅ 直接 | 文本匹配 |
+| 8.11 | Javadoc 需含 `@param` / `@return` / `@throws` | 4.8 | 强制 | ✅ 直接 | Javadoc 块内标签存在性 |
+
+### 9.9 参数校验（4.9）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 9.1 | 对参数进行必要的非空 / 合法性校验 | 4.9 | 强制 | ⛔ 暂不可 | 「是否必要」为设计判断；仅可做「对外接口入参须有校验注解」的近似规则 |
+| 9.2 | 验证参数时使用断言或合适的工具 | 4.9 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 9.3 | 避免在方法内部进行大量校验 | 4.9 | 强制 | ⛔ 暂不可 | 「大量」为主观判断 |
+| 9.4 | 按调用频次 / 稳定性 / 权限级别区分是否校验 | 4.9 | 强制 | ⛔ 暂不可 | 需调用频次与调用方信息 |
+
+### 9.10 日志规约（4.10）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 10.1 | 禁止直接使用 Log4j / Logback / Log4j2 API，须走 SLF4J | 4.10 | 强制 | ✅ 直接 | 已有 **J017**（import 层） |
+| 10.2 | 关键日志保留 15 天以上 | 4.10 | 强制 | ⛔ 暂不可 | 运行期 / 配置，需 `log4j2.xml` 通道 |
+| 10.3 | 日志输出必须使用占位符 `{}` 而非字符串拼接 | 4.10 | 强制 | ✅ 已落地 | 日志方法实参含 `BinaryExpr(op="+")`（→ J610） |
+| 10.4 | 低于生产日志级别的输出必须先做 `isXxxEnabled()` 判断 | 4.10 | 强制 | ✅ 直接 | `debug` / `trace` 调用所在块无对应 `isXxxEnabled` |
+| 10.5 | 日志配置须设 `additivity=false` 防止重复打印 | 4.10 | 强制 | ⛔ 暂不可 | 配置文件 |
+| 10.6 | 异常日志必须包含现场信息与异常堆栈 | 4.10 | 强制 | ✅ 直接 | `error` / `warn` 调用未传异常对象作为末位实参 |
+| 10.7 | 禁止使用 `%C` / `%F` / `%l` / `%L` / `%M` 位置信息占位符 | 4.10 | 强制 | ✅ 直接 | 字符串字面量中含这些占位符 |
+| 10.8 | 推荐使用异步日志 | 4.10 | 强制 | ⛔ 暂不可 | 配置文件 |
+| 10.9 | 按环境选择日志级别（生产禁用 Debug） | 4.10 | 强制 | ⛔ 暂不可 | 配置文件 |
+| 10.10 | 用户输入参数错误用 `warn`，系统错误用 `error` | 4.10 | 推荐 | ⛔ 暂不可 | 语义判断 |
+| 10.11 | 国际化产品的日志使用英文 | 4.10 | 推荐 | ⛔ 暂不可 | 语义判断 |
+| 10.12 | 使用 `RollingFile` 并采用大小 + 时间双滚动策略 | 4.10 | 推荐 | ⛔ 暂不可 | 配置文件 |
+| 10.13 | 谨慎在循环中执行日志打印 | 4.10 | 强制 | ✅ 直接 | 循环体内出现日志调用 |
+| 10.14 | 禁止 `System.out` / `System.err` 打印 | 4.10 | 强制 | ✅ 直接 | 已有 **J001** |
+| 10.15 | 异常信息应包含排查所需上下文 | 4.10 | 强制 | ⛔ 暂不可 | 语义判断 |
+
+### 9.11 正则表达式（4.11）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 11.1 | 保持正则简洁可读 | 4.11 | 推荐 | ⛔ 暂不可 | 主观判断 |
+| 11.2 | 正则表达式必须预编译（`static final Pattern`） | 4.11 | 推荐 | ✅ 直接 | `Pattern.compile` 出现在方法体内而非 `static final` 字段 |
+| 11.3 | 合理使用非贪婪量词 | 4.11 | 推荐 | ⛔ 暂不可 | 语义判断 |
+| 11.4 | 避免导致大量回溯的复杂模式 | 4.11 | 推荐 | ⛔ 暂不可 | 需正则静态分析 |
+| 11.5 | 使用 `^` / `$` / `\b` 锚定边界 | 4.11 | 推荐 | ✅ 直接 | 正则字面量未以 `^` 开头（弱，误报偏高） |
+
+### 9.12 异常处理（5）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 12.1 | 可预检查的 RuntimeException 不应靠 catch 处理 | 5 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 12.2 | 异常不得用于流程控制 / 条件控制 | 5 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 12.3 | 禁止对大段代码 try-catch | 5 | 强制 | ✅ 直接 | `TryStmt.try_body` 语句数超阈值 |
+| 12.4 | 禁止吞异常（捕获后不处理也不上抛） | 5 | 强制 | ✅ 直接 | 已有 **J008**（空 catch）；补 `printStackTrace` 形态 |
+| 12.5 | 事务代码中 catch 异常后须手动回滚 | 5 | 强制 | 🔧 改造 | 需识别事务注解 / 事务边界 |
+| 12.6 | 资源必须及时释放，优先 try-with-resources | 5 | 强制 | ✅ 直接 | `TryStmt.resources` 为空且 try 体内创建了需关闭的资源（启发式，`info`） |
+| 12.7 | 重要异常必须捕获 + 记录日志 + 报监控 | 5 | 强制 | 🔧 改造 | 需识别「重要异常」与监控上报 |
+| 12.8 | `finally` 块中禁止 `return` | 5 | 强制 | ✅ 已落地 | `TryStmt.finally_body` 含 `ReturnStmt`（→ J601） |
+| 12.9 | 捕获异常与抛出异常类型必须匹配 | 5 | 强制 | ⛔ 暂不可 | 需类型继承关系 |
+| 12.10 | 方法返回 null 必须注释说明 | 5 | 强制 | ⛔ 暂不可 | 需判断返回 null 的分支 |
+| 12.11 | NPE 六大产生场景需防范 | 5 | 强制 | 🔧 改造 | 需数据流 |
+| 12.12 | 对外用错误码 / 内部用异常 / 跨应用 RPC 用 Result | 5 | 强制 | ⛔ 暂不可 | 架构约定 |
+| 12.13 | 使用有业务含义的自定义异常，禁抛 `RuntimeException` / `Exception` / `Throwable` | 5 | 强制 | ✅ 已落地 | `ThrowStmt` 的异常类型白名单（→ J602） |
+| 12.14 | 避免重复代码（DRY） | 5 | 强制 | ⛔ 暂不可 | 需代码相似度分析 |
+
+### 9.13 工程结构与分层（6）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 13.1 | TBB 不可直接调用 KBB | 6 | 强制 | 🔧 改造 | 需模块依赖图；**建议改用 ArchUnit** |
+| 13.2 | KBB 之间不可相互调用 | 6 | 强制 | 🔧 改造 | 同上 |
+| 13.3 | DBB 封装 DAL 隔离数据访问 | 6 | 强制 | 🔧 改造 | 同上 |
+
+### 9.14 JVM 运行参数（7）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 14.1 | 监控参数必配（`-verbose:gc`、`-Xloggc`、`-XX:+PrintGCDetails` 等 9 项） | 7.2.1 | 强制 | 🔧 改造 | 需启动脚本 / `*.yml` 文件通道 |
+| 14.2 | `-server` 必配 | 7.2.2 | 强制 | 🔧 改造 | 同上 |
+| 14.3 | `-Xms` 与 `-Xmx` 一致且不超过机器内存 50% | 7.2.2 | 强制 | 🔧 改造 | 同上 |
+| 14.4 | GC 选型与行为参数 | 7.2.2 | 强制 | 🔧 改造 | 同上 |
+| 14.5 | `-XX:MetaspaceSize` 与 `-XX:MaxMetaspaceSize` 一致 | 7.2.2 | 强制 | 🔧 改造 | 同上 |
+| 14.6 | `ReservedCodeCacheSize` 按需调整 | 7.2.2 | 强制 | 🔧 改造 | 同上 |
+| 14.7 | `-Xss` / 堆空间分配 / `MaxDirectMemorySize` 可选调优 | 7.2.3 | 推荐 | 🔧 改造 | 同上 |
+| 14.8 | DNS 缓存 TTL 不得过大或为 -1 | 7.2.4 | 强制 | 🔧 改造 | 同上 |
+| 14.9 | `NativeMemoryTracking` / `TraceClassLoading` 生产禁用 | 7.2.5 | 强制 | 🔧 改造 | 同上 |
+| 14.10 | 内存占用评估（在线用户数 / TPS / 数据加载 / 缓存） | 7.1 | 强制 | ⛔ 暂不可 | 运行期指标 + 压测 |
+| 14.11 | 堆内缓存仅用于体积小、进程内独享的数据 | 7.1.4 | 强制 | ⛔ 暂不可 | 语义判断 |
+
+### 9.15 开源软件使用（8）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 15.1 | 禁止使用 fastjson（大对象 OOM 风险） | 8.1 | 强制 | ✅ 直接 | 已有 **J010**（import）+ **J012**（用法） |
+| 15.2 | fastjson 版本 ≤1.2.59 存在 OOM 漏洞 | 8.1 | 强制 | ⛔ 暂不可 | 需依赖清单；**建议用 SCA 工具** |
+| 15.3 | 序列化场景推荐使用 Jackson | 8.1 | 强制 | ✅ 直接 | 已有 **J014** / **J015** |
+| 15.4 | `AsyncLogger` 与 `AsyncAppender` 不得对同一条日志同时使用 | 8.2 | 强制 | ⛔ 暂不可 | 配置文件 |
+| 15.5 | 使用异步日志须引入 `com.lmax:disruptor` | 8.2 | 强制 | ⛔ 暂不可 | 需依赖树 |
+| 15.6 | 异步日志缓冲区大小与刷新策略需评估 | 8.2 | 强制 | ⛔ 暂不可 | 配置文件 |
+
+### 9.16 数据库相关（9）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 16.1 | 小数据量用直接读取，大数据量用流式读取 | 9.1 | 强制 | ⛔ 暂不可 | 需数据量判断 |
+| 16.2 | 禁止使用游标读取 | 9.1 | 强制 | ✅ 直接 | `Cursor` / `TYPE_SCROLL_*` API 白名单（弱，`info`） |
+| 16.3 | druid 参数需按要求配置（`maxActive` 20-50、`testWhileIdle=true` 等） | 9.2 | 强制 | 🔧 改造 | 需 `application.yml` 通道 |
+| 16.4 | 禁止设置全局自动提交为 false | 9.2 | 强制 | 🔧 改造 | 同上 |
+| 16.5 | 连接超时优先用 `socketTimeout`，不推荐 `StatementTimeout` | 9.3 | 强制 | ✅ 直接 | `setQueryTimeout` 调用 |
+| 16.6 | 捕获连接超时对应的异常类型 | 9.3 | 强制 | ⛔ 暂不可 | 需类型匹配 |
+
+### 9.17 国际化与本地化（10）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 17.1 | JVM 必须设置 `-Dfile.encoding=UTF-8` | 10.1 | 强制 | 🔧 改造 | 需启动脚本通道 |
+| 17.2 | 遗留非 Unicode 文件读写须显式指定字符集 | 10.1 | 强制 | ✅ 直接 | `new String(bytes)` / `getBytes()` 无字符集参数 |
+| 17.3 | `Character.is*` 系列应使用 int 码点重载 | 10.1 | 强制 | ⛔ 暂不可 | 需类型推断 |
+| 17.4 | 汉字范围检查须覆盖 CJK 扩充区 | 10.1 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 17.5 | 禁止硬编码中文提示，须用 `ResourceBundle` | 10.2 | 强制 | ✅ 直接 | 字符串字面量含中文（弱） |
+| 17.6 | 日期 / 数值按 Locale 格式化 | 10.2 | 强制 | ✅ 直接 | `SimpleDateFormat` / `DecimalFormat` 未传 Locale（弱） |
+| 17.7 | 时区设为 `GMT+8`，禁用含夏令时的时区 | 10.3 | 强制 | 🔧 改造 | 需启动脚本通道 |
+
+### 9.18 日期时间（11）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 18.1 | 新项目推荐使用 JDK8 日期类 | 11 | 强制 | ✅ 直接 | `Date` / `Calendar` 使用提示（`info`） |
+| 18.2 | `SimpleDateFormat` 注意线程安全，推荐 `DateTimeFormatter` | 11.1 | 强制 | ✅ 直接 | 同 6.6；非 static 场景仅提示 |
+| 18.3 | 格式化使用 `yyyy` 而非 `YYYY` | 11.1 | 强制 | ✅ 直接 | 模式串字面量含 `YYYY` |
+| 18.4 | 一般日期时间格式为 `yyyy-MM-dd HH:mm:ss` | 11.1 | 强制 | ✅ 直接 | 模式串不等于推荐值（弱，误报偏高） |
+| 18.5 | 注意 `Calendar` 月份 0-11 与 `LocalDateTime` 月份 1-12 差异 | 11.2 | 强制 | ⛔ 暂不可 | 语义判断 |
+
+### 9.19 响应状态码与错误码（12）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 19.1 | 仅使用有明确含义的 HTTP 状态码，严禁自定义值 | 12 | 强制 | ✅ 直接 | 状态码字面量不在标准白名单内（弱） |
+| 19.2 | 错误码须符合接口实施策略 | 12 | 强制 | ⛔ 暂不可 | 需对照外部文档 |
+| 19.3 | 错误码须符合错误信息编写规范 | 12 | 强制 | ⛔ 暂不可 | 同上 |
+
+### 9.20 Spring Boot 专项（13）
+
+| 编号 | 规则 | 出处 | 效力 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| 20.1 | 慎用 `@ComponentScan(basePackages=...)` 扩大扫描范围 | 13.1 | 强制 | ✅ 已落地 | `match_members` 匹配 `basePackages`（→ J701） |
+| 20.2 | 慎用 `@SpringBootApplication(scanBasePackages=...)` | 13.1 | 强制 | ✅ 已落地 | `match_members` 匹配 `scanBasePackages`（→ J702） |
+| 20.3 | SDK / 子模块应通过 `spring.factories` 或 `@Enable...` 自装配 | 13.1 | 强制 | ⛔ 暂不可 | 需工程结构判断 |
+| 20.4 | 禁止创建同名 Bean | 13.1 | 强制 | 🔧 改造 | 需跨文件汇总 Bean 定义（ProjectRule） |
+| 20.5 | 善用 `@ConditionalOn*` 区分场景 | 13.1 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 20.6 | 建议使用构造器注入，禁止字段注入 | 13.2 | 强制 | ✅ 直接 | `@Autowired` 出现在字段上 |
+| 20.7 | 多个实例 Bean 时用 `@Qualifier` 指定 | 13.2 | 强制 | ⛔ 暂不可 | 需 Bean 定义汇总 |
+| 20.8 | 网络 / 数据库依赖由使用者主动创建 | 13.2 | 强制 | ⛔ 暂不可 | 语义判断 |
+| 20.9 | 接口参数校验使用 Validator（`@NotNull` + `@Valid`） | 13.3 | 强制 | ✅ 直接 | Controller 方法参数缺 `@Valid`（弱） |
+| 20.10 | 统一异常处理使用 `@ControllerAdvice` / `@RestControllerAdvice` | 13.3 | 强制 | ✅ 直接 | 存在分散 try-catch 而无全局处理器（弱） |
+| 20.11 | 复杂配置使用 `@ConfigurationProperties` 而非 `@Value` | 13.4 | 强制 | ✅ 直接 | 类中 `@Value` 注解数量超阈值 |
+| 20.12 | 禁止将敏感信息明文写入配置文件 | 13.4 | 强制 | 🔧 改造 | 需配置文件通道 |
+| 20.13 | 预热逻辑必须在服务注册前完成 | 13.5 | 强制 | ⛔ 暂不可 | 运行期事件时序 |
+
+---
+
+## 十、已落地规则实现明细（改动文件 + 核心实现位置）
+
+> 本章对应第九章表格中标记为「✅ 已落地」的 23 条规则，逐条给出**改动文件**与**核心实现位置（引擎侧落点）**。
+> 全部规则默认 `enabled = false`（注册于 `javaguard.rules.toml`），以免冲击 `verify.sh` 的 7-违规基线；
+> 验证时通过 `java-guard scan <dir> --enable Jxxx` 单独激活。
+
+| 规范编号 | 规则 ID | 载体 | 改动文件 | 核心实现位置（引擎侧落点） |
+|---|---|---|---|---|
+| 1.1 | J101 | YAML | `rules/J101_class_name_no_underscore_dollar.yml` + `javaguard.rules.toml` | `pattern.type=ClassDeclaration` + `match_fields.name="^[_$].*\|.*[_$]$"`（正则匹配类名首尾 `_`/`$`） |
+| 1.10 | J104 | YAML | `rules/J104_boolean_no_is_prefix.yml` + `javaguard.rules.toml` | `pattern.type=FieldDeclaration` + `match_fields: name="^is[A-Z]"`, `field_type=[boolean,Boolean]`（布尔字段禁 `is` 前缀） |
+| 1.22 | J103 | YAML | `rules/J103_no_pojo_suffix.yml` + `javaguard.rules.toml` | `pattern.type=ClassDeclaration` + `match_fields.name=".*POJO$"`（类名禁以 `POJO` 结尾） |
+| 3.1 | J202 | Rhai | `rules/rhai/J202_no_tab_indent.rhai` + `javaguard.rules.toml` | 遍历 `lines`，`lines[i].contains("\t")` → 命中（行内 tab 字符） |
+| 3.2 | J201 | Rhai | `rules/rhai/J201_max_line_length.rhai` + `javaguard.rules.toml` | 遍历 `lines`，`len(lines[i]) > max_len`（默认 120）→ 命中；`max_len` 取自 `config` 可配 |
+| 3.3 | J204 | Rhai | `rules/rhai/J204_unix_line_ending.rhai` + `javaguard.rules.toml` | 一次判断 `source.contains("\r\n")` → 命中（全文件 CRLF 检测） |
+| 3.4 | J203 | Rhai | `rules/rhai/J203_no_trailing_whitespace.rhai` + `javaguard.rules.toml` | 取行尾字符 `sub_string(n-1,1)` ∈ {` `,`\t`} → 命中；刻意不用 `trim()`（引擎未注册该方法） |
+| 4.9 | J301 | Rhai | `rules/rhai/J301_no_bigdecimal_double.rhai` + `javaguard.rules.toml` | `collect(ast,"ObjectCreationExpr")` → `class_name=="BigDecimal"` 且首参 `LiteralExpr` 且 `is_float_literal`（含 `.` 或后缀 `d/D/f/F`） |
+| 4.13 | J302 | Rhai | `rules/rhai/J302_pojo_no_default_value.rhai` + `javaguard.rules.toml` | `walk_type` 递归，`is_pojo(name)`（后缀 DO/DTO/BO/VO）且 `FieldDeclaration.initializer` 存在（`type_of=="map"`）→ 命中 |
+| 4.16 | J303 | Rhai | `rules/rhai/J303_pojo_must_tostring.rhai` + `javaguard.rules.toml` | `walk_type`，`is_pojo(name)` 且成员无 `MethodDeclaration.name=="toString"` → 命中 |
+| 5.1 | J304 | Rhai | `rules/rhai/J304_equals_hashcode_pair.rhai` + `javaguard.rules.toml` | `walk_type`，类内 `has_equals && !has_hash` → 命中 |
+| 5.6 | J402 | Rhai | `rules/rhai/J402_toarray_with_typed_array.rhai` + `javaguard.rules.toml` | `collect(ast,"MethodCallExpr")`，`method_name=="toArray"` 且无参（`arguments` 非 array 或 `len==0`）→ 命中 |
+| 5.11 | J401 | YAML | `rules/J401_no_collection_modify_in_foreach.yml` + `javaguard.rules.toml` | `pattern.type=MethodCall` + `match_fields.method=[remove,add,clear,removeAll,retainAll,addAll]` + `within=[ForEachStmt]` |
+| 6.3 | J503 | Rhai | `rules/rhai/J503_no_new_thread.rhai` + `javaguard.rules.toml` | `collect(ast,"ObjectCreationExpr")`，`class_name=="Thread"` 或 `ends_with(".Thread")` → 命中；依赖 P0-3 后 `AstSerializer` 新增 `scope` 字段递归可达匿名类内 `new Thread` |
+| 6.5 | J501 | YAML | `rules/J501_no_executors_thread_pool.yml` + `javaguard.rules.toml` | `pattern.type=MethodCall` + `match_fields.callee="Executors"`（禁 `Executors.xxx()` 建池） |
+| 6.6 | J502 | YAML | `rules/J502_no_static_dateformat.yml` + `javaguard.rules.toml` | `pattern.type=FieldDeclaration` + `match_fields.field_type="*SimpleDateFormat*"`, `modifier=static`（非线程安全 Format 禁 static 共享） |
+| 7.2 | J510 | Rhai | `rules/rhai/J510_switch_must_have_default.rhai` + `javaguard.rules.toml` | `collect(ast,"SwitchStmt")`，`cases` 中无 `label==null`（default）→ 命中 |
+| 7.4 | J511 | Rhai | `rules/rhai/J511_require_braces.rhai` + `javaguard.rules.toml` | `collect` IfStmt/ForStmt/ForEachStmt/WhileStmt/DoStmt，`then_stmt`/`else_stmt`/`body` 非 `BlockStmt`（else 为 IfStmt 豁免）→ 命中 |
+| 10.3 | J610 | Rhai | `rules/rhai/J610_log_must_use_placeholder.rhai` + `javaguard.rules.toml` | `collect(ast,"MethodCallExpr")`，`is_log_method(method) && is_logger(callee)` 且首参 `BinaryExpr(op=="+")` → 命中（日志禁字符串拼接） |
+| 12.8 | J601 | Rhai | `rules/rhai/J601_no_return_in_finally.rhai` + `javaguard.rules.toml` | `collect(ast,"TryStmt")`，`finally_body` 内 `collect(...,"ReturnStmt")` → 命中（嵌套 return 可检出） |
+| 12.13 | J602 | Rhai | `rules/rhai/J602_no_generic_exception.rhai` + `javaguard.rules.toml` | `collect(ast,"ObjectCreationExpr")`，`is_generic_exception(class_name)`（RuntimeException/Exception/Throwable，含全限定名）→ 命中 |
+| 20.1 | J701 | YAML | `rules/J701_no_componentscan_basepackages.yml` + `javaguard.rules.toml` | `pattern.type=Annotation` + `match_fields.name="ComponentScan"` + `match_members.basePackages="*"`（P0-2 注解参数回填） |
+| 20.2 | J702 | YAML | `rules/J702_no_scanbasepackages.yml` + `javaguard.rules.toml` | `pattern.type=Annotation` + `match_fields.name="SpringBootApplication"` + `match_members.scanBasePackages="*"`（P0-2 注解参数回填） |
+
+### 10.1 公共改动与配套修复（本次批量落地同期完成）
+
+| 改动 | 文件 | 说明 |
+|---|---|---|
+| `--enable` 覆盖 `enabled=false` 修复 | `src/main.rs`（`run_scan` / `run_rules`） | 原 `run_rules` 二次 `enabled()` 过滤 + `run_scan` 先 `retain(enabled)` 再处理 `--enable`，导致 `enabled=false` 规则无法被 `--enable` 激活；改为「先 disable、再 enable（非空则忽略 enabled 标志）、否则 retain enabled」并移除 `run_rules` 二次门禁 |
+| J503 AST 缺口修复 | `java-parser/src/main/java/com/javaguard/parser/AstSerializer.java` | `MethodCallExpr` 序列化新增 `scope` 字段（序列化后的 scope map），使 `new Thread(new Runnable(){...}).start()` 中的 `Thread` 对象创建可被 Rhai `collect` 递归命中；保留 `callee` 字符串以兼容 J001/J012/J015/J501/J610 |
+| 回归测试 | `tests/pipeline.rs`（`pipeline_enable_overrides_disabled_flag`） | 验证 `--enable J104` 可激活 `enabled=false` 规则、默认不触发 |
+
+### 10.2 落地验证结论
+
+- **功能验证**：BadCase 夹具（23 条规则各含一个触发点）以 `--enable J101,J103,J104,J201,J202,J203,J204,J301,J302,J303,J304,J401,J402,J501,J502,J503,J510,J511,J601,J602,J610,J701,J702` 扫描，**23/23 全部命中，无误报**。
+- **基线零回归**：`examples/sample-java`（4 文件）仍固定 **7 条违规**（J001×2、J003、J008、J009、J010、J012），未受新增规则影响。
+- **测试**：`cargo test --workspace` 全量通过（含新增回归测试）；`clippy -p rule-yaml --no-deps -- -D warnings` 干净。
+- **已知局限**：J202（tab）/J203（行尾空白）/J204（CRLF）为纯文本判定，会命中字符串字面量 / 注释中的同类字符，属可接受的小概率误报；如需精确到 token 位置需 P1 的 token 级通道。
+
+---
+
 ## 附录 A：本文引用到的源码位置
 
 | 结论 | 位置 |
@@ -595,6 +991,10 @@ enabled = true
 | 已有数据流能力（常量传播） | `src/rules/j009_infinite_loop.rs`（2250 行） |
 
 ## 附录 B：可直接用现有引擎实现的条款（无需任何扩展）
+
+> **落地进度**：本批条款中已有 23 条在 P1 第一批落地（详见第十章「已落地规则实现明细」），
+> 对应规则 J101/J103/J104/J201–J204/J301–J304/J401/J402/J501/J502/J503/J510/J511/J601/J602/J610/J701/J702；
+> 表中其余条款仍待后续批次。
 
 先做这批可以快速验证价值：
 

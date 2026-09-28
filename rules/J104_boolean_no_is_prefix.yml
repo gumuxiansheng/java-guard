@@ -1,0 +1,10 @@
+id: J104
+title: 布尔类型字段不得加 is 前缀
+severity: major
+category: convention
+pattern:
+  type: FieldDeclaration
+  match_fields:
+    name: "^is[A-Z]"
+    field_type: [boolean, Boolean]
+message: "布尔字段 '{name}'（{field_type}）不应加 is 前缀，RPC 框架反向解析时会把属性名误判为去掉 is 后的名称，导致序列化错误"

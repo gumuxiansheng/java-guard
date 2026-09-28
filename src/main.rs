@@ -352,13 +352,14 @@ fn read_source_file(path: &Path, encoding: &str) -> Result<String, String> {
     Ok(decode_source_bytes(&bytes, encoding))
 }
 
-/// 对所有启用的规则执行检查，返回原始违规列表（不过滤）。
+/// 对所有传入的规则执行检查，返回原始违规列表（不过滤）。
+///
+/// 规则的启用/禁用与 enable/disable 覆盖已在调用方（`run_scan` 的列表层过滤）完成，
+/// 此处只负责执行，不再二次判断 `enabled()`——否则 `--enable` 对 `enabled=false`
+/// 的规则会失效（被选中进入列表却在闸门处被跳过）。
 fn run_rules(unit: &CompilationUnit, rule_list: &[Arc<dyn Rule<CompilationUnit>>]) -> Vec<Violation> {
     let mut violations = Vec::new();
     for rule in rule_list {
-        if !rule.enabled() {
-            continue;
-        }
         violations.extend(rule.check_unit(unit));
     }
     violations
@@ -702,16 +703,24 @@ fn run_scan(
         }
     }
 
-    // 规则过滤：enable / disable
-    rule_list.retain(|r| !disable_ids.iter().any(|d| r.id().0 == *d));
+    // 规则过滤（列表层即最终生效集，run_rules 不再二次判断 enabled）：
+    // 1) disable 总是生效（移除指定 ID）；
+    // 2) enable 覆盖优先级最高——非空时仅保留列出的规则，无视 enabled 字段
+    //    （否则 enabled=false 的规则即便被 --enable 选中，仍会在 run_rules 的 enabled() 闸门被跳过）；
+    // 3) 未指定 enable 时，默认仅保留 enabled=true 的规则。
+    if !disable_ids.is_empty() {
+        rule_list.retain(|r| !disable_ids.iter().any(|d| r.id().0 == *d));
+    }
     if !enable_ids.is_empty() {
         rule_list.retain(|r| enable_ids.iter().any(|e| r.id().0 == *e));
+    } else {
+        rule_list.retain(|r| r.enabled());
     }
 
     // 规则过滤：min_severity
     rule_list.retain(|r| r.severity() >= min_sev);
 
-    let enabled_count = rule_list.iter().filter(|r| r.enabled()).count();
+    let enabled_count = rule_list.len();
 
     // 扫描文件
     let root = Path::new(path);

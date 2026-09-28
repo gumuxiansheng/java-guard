@@ -1,0 +1,9 @@
+id: J501
+title: 禁止使用 Executors 创建线程池
+severity: major
+category: concurrency
+pattern:
+  type: MethodCall
+  match_fields:
+    callee: Executors
+message: "禁止使用 Executors.{method}() 创建线程池——FixedThreadPool/SingleThreadPool 的请求队列长度为 Integer.MAX_VALUE、CachedThreadPool 的线程数为 Integer.MAX_VALUE，均可能 OOM；请改用 ThreadPoolExecutor 显式指定核心线程数、队列容量与拒绝策略"

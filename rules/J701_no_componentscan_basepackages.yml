@@ -1,0 +1,11 @@
+id: J701
+title: 禁止 @ComponentScan 显式指定 basePackages 扩大扫描范围
+severity: major
+category: spring
+pattern:
+  type: Annotation
+  match_fields:
+    name: ComponentScan
+  match_members:
+    basePackages: "*"
+message: "@{name}({member}) 显式声明了扫描包，会扩大组件扫描范围并拖慢启动；SDK/子模块应改用自动装配（spring.factories 或 @Enable* 注解）"

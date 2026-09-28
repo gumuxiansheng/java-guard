@@ -246,3 +246,103 @@ fn pipeline_j009_infinite_loop_real_parse() {
         "REGRESSION: J009 falsely reported normal for loop at LoopCases.java:6\nstdout: {stdout}"
     );
 }
+
+/// 回归：被显式 `--enable` 的规则必须无视其 `enabled=false` 真正执行。
+///
+/// 仓库 `javaguard.rules.toml` 中 J104（布尔字段禁止 is 前缀）默认 `enabled=false`。
+/// 历史上 `--enable` 只把规则留在列表里，却因 `run_rules` 的 `enabled()` 二次闸门
+/// 仍被跳过 —— 表现为「0 rules enabled」。本测试锁定修复后的正确行为。
+#[test]
+fn pipeline_enable_overrides_disabled_flag() {
+    let bin = env!("CARGO_BIN_EXE_java-guard");
+    let manifest = env!("CARGO_MANIFEST_DIR");
+
+    let jar = PathBuf::from(manifest).join("java-parser/target/java-parser.jar");
+    if !jar.exists() {
+        eprintln!("skip: {} not built", jar.display());
+        return;
+    }
+    let java = match java_cmd() {
+        Some(j) => j,
+        None => {
+            eprintln!("skip: java runtime not available");
+            return;
+        }
+    };
+
+    // 构造一个仅含 J104 触发点的临时 .java（isActive 命中；ok 不命中）
+    let tmp = std::env::temp_dir().join("javaguard_enable_test");
+    let _ = std::fs::create_dir_all(&tmp);
+    let java_file = tmp.join("Sample.java");
+    std::fs::write(
+        &java_file,
+        "package demo;\npublic class Sample {\n    private boolean isActive;\n    private boolean ok;\n}\n",
+    )
+    .unwrap();
+
+    let rules_file = PathBuf::from(manifest).join("javaguard.rules.toml");
+
+    // 1) 显式启用 J104 → 必须命中 isActive
+    let out_enabled = Command::new(bin)
+        .arg("scan")
+        .arg(&tmp)
+        .arg("-f")
+        .arg("json")
+        .arg("--parser-jar")
+        .arg(&jar)
+        .arg("--rules-file")
+        .arg(&rules_file)
+        .arg("--config")
+        .arg("__none__.toml")
+        .arg("--enable")
+        .arg("J104")
+        .arg("--no-cache")
+        .env("JAVA_CMD", &java)
+        .output()
+        .expect("failed to execute java-guard");
+    let stdout_enabled = String::from_utf8_lossy(&out_enabled.stdout);
+    let parsed_en: serde_json::Value = serde_json::from_str(&stdout_enabled)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\n{stdout_enabled}"));
+    let empty_en: Vec<serde_json::Value> = Vec::new();
+    let ids_en: Vec<&str> = parsed_en["violations"]
+        .as_array()
+        .unwrap_or(&empty_en)
+        .iter()
+        .map(|v| v["rule_id"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        ids_en.iter().any(|r| *r == "J104"),
+        "J104 must fire when explicitly --enable'd (enabled=false in toml)\nids: {ids_en:?}\n{stdout_enabled}"
+    );
+
+    // 2) 不启用 → J104 必须落空（默认 enabled=false 被列表层过滤移除）
+    let out_default = Command::new(bin)
+        .arg("scan")
+        .arg(&tmp)
+        .arg("-f")
+        .arg("json")
+        .arg("--parser-jar")
+        .arg(&jar)
+        .arg("--rules-file")
+        .arg(&rules_file)
+        .arg("--config")
+        .arg("__none__.toml")
+        .arg("--no-cache")
+        .env("JAVA_CMD", &java)
+        .output()
+        .expect("failed to execute java-guard");
+    let stdout_default = String::from_utf8_lossy(&out_default.stdout);
+    let parsed_de: serde_json::Value = serde_json::from_str(&stdout_default)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\n{stdout_default}"));
+    let empty_de: Vec<serde_json::Value> = Vec::new();
+    let ids_de: Vec<&str> = parsed_de["violations"]
+        .as_array()
+        .unwrap_or(&empty_de)
+        .iter()
+        .map(|v| v["rule_id"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        !ids_de.iter().any(|r| *r == "J104"),
+        "J104 must NOT fire by default (enabled=false)\nids: {ids_de:?}\n{stdout_default}"
+    );
+}
