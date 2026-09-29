@@ -8,18 +8,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use crate::adapters::RhaiRuleAdapter;
 use clap::Parser;
 use guard_core::gate::{GateConfig, GateResult, SeverityCounts};
 use guard_core::git_diff;
 use guard_core::reporter::{report_to, ReportFormat};
 use guard_core::rule::{Rule, RuleId, Violation, ViolationCollector};
 use java_ast::ast::CompilationUnit;
-use java_ast::bridge::{CliParser, DaemonPool, JavaParser};
+use java_ast::bridge::{CliParser, JavaParser, LazyParser};
 use java_ast::AstCache;
 use java_ast::ParseError;
-use rule_yaml::YamlRuleAdapter;
 use rule_rhai::rule::RhaiRule;
-use crate::adapters::RhaiRuleAdapter;
+use rule_yaml::YamlRuleAdapter;
 
 #[derive(Parser)]
 #[clap(
@@ -45,7 +45,7 @@ Quick start:\n\
   java-guard scan src/main -f json    # JSON report for src/main\n\
   java-guard scan . --gate            # CI gate mode (exit 1 on violations)\n\
 \n\
-Documentation: https://github.com/javaguard/java-guard\n",
+Documentation: https://github.com/javaguard/java-guard\n"
 )]
 struct Cli {
     #[clap(subcommand)]
@@ -53,6 +53,8 @@ struct Cli {
 }
 
 #[derive(clap::Subcommand)]
+// Scan 子命令携带十余个 CLI 字段，与其他单元变体体积悬殊属预期（clippy::large_enum_variant）。
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// 扫描 Java 代码，检测代码质量问题与潜在 bug
     ///
@@ -146,6 +148,10 @@ enum Command {
         /// 禁用 AST 解析缓存（默认启用，缓存目录 .java-guard-cache/）
         #[clap(long)]
         no_cache: bool,
+
+        /// 输出各阶段耗时分解到 stderr（性能定位用：rules-load/traverse/diff/check/report）
+        #[clap(long)]
+        timings: bool,
     },
     /// 列出所有可用规则（内置 + YAML + Rhai）
     Rules,
@@ -158,19 +164,52 @@ fn main() {
 
     match cli.command {
         Command::Scan {
-            path, format, output, exclude, include, rules_file, diff, semantic_diff, baseline_out,
-            baseline, baseline_tolerance,
-            gate, gate_config,
-            enable, disable, min_severity, parser_jar, java_cmd, config, encoding, no_cache,
+            path,
+            format,
+            output,
+            exclude,
+            include,
+            rules_file,
+            diff,
+            semantic_diff,
+            baseline_out,
+            baseline,
+            baseline_tolerance,
+            gate,
+            gate_config,
+            enable,
+            disable,
+            min_severity,
+            parser_jar,
+            java_cmd,
+            config,
+            encoding,
+            no_cache,
+            timings,
         } => {
             if let Err(e) = run_scan(
-                &path, &format, output.as_deref(), exclude.as_deref(), include.as_deref(),
-                rules_file.as_deref(), diff.as_deref(), semantic_diff, baseline_out.as_deref(),
-                baseline.as_deref(), baseline_tolerance,
-                gate, gate_config.as_deref(),
-                enable.as_deref(), disable.as_deref(), &min_severity,
-                parser_jar.as_deref(), java_cmd.as_deref(), config.as_str(), encoding.as_str(),
+                &path,
+                &format,
+                output.as_deref(),
+                exclude.as_deref(),
+                include.as_deref(),
+                rules_file.as_deref(),
+                diff.as_deref(),
+                semantic_diff,
+                baseline_out.as_deref(),
+                baseline.as_deref(),
+                baseline_tolerance,
+                gate,
+                gate_config.as_deref(),
+                enable.as_deref(),
+                disable.as_deref(),
+                &min_severity,
+                parser_jar.as_deref(),
+                java_cmd.as_deref(),
+                config.as_str(),
+                encoding.as_str(),
                 no_cache,
+                timings,
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(2);
@@ -187,7 +226,10 @@ fn main() {
             match load_rules_file(rules_file_path) {
                 Ok(entries) if !entries.is_empty() => {
                     println!("Rules (from {}):", rules_file_path);
-                    println!("{:<8} {:<30} {:<10} {:<8} {}", "ID", "Name", "Group", "Severity", "Description");
+                    println!(
+                        "{:<8} {:<30} {:<10} {:<8} Description",
+                        "ID", "Name", "Group", "Severity"
+                    );
                     println!("{}", "-".repeat(90));
                     for entry in &entries {
                         let group = entry.group.as_deref().unwrap_or("-");
@@ -290,6 +332,25 @@ struct FileCheck {
     error_msg: Option<String>,
 }
 
+/// 每文件阶段耗时累计（跨 worker 求和，`--timings` 时输出）。
+///
+/// read/parse/rules 三项之和 ≥ check 阶段墙钟时间（并行 worker 各自累加）。
+#[derive(Default)]
+struct Timings {
+    read_ms: std::sync::atomic::AtomicU64,
+    parse_ms: std::sync::atomic::AtomicU64,
+    rules_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Timings {
+    fn add(counter: &std::sync::atomic::AtomicU64, started: Instant) {
+        counter.fetch_add(
+            started.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 /// 编码探测：把原始字节按指定编码解码为 UTF-8 字符串（永不失败，回退链完备）。
 ///
 /// 支持的编码：
@@ -357,7 +418,10 @@ fn read_source_file(path: &Path, encoding: &str) -> Result<String, String> {
 /// 规则的启用/禁用与 enable/disable 覆盖已在调用方（`run_scan` 的列表层过滤）完成，
 /// 此处只负责执行，不再二次判断 `enabled()`——否则 `--enable` 对 `enabled=false`
 /// 的规则会失效（被选中进入列表却在闸门处被跳过）。
-fn run_rules(unit: &CompilationUnit, rule_list: &[Arc<dyn Rule<CompilationUnit>>]) -> Vec<Violation> {
+fn run_rules(
+    unit: &CompilationUnit,
+    rule_list: &[Arc<dyn Rule<CompilationUnit>>],
+) -> Vec<Violation> {
     let mut violations = Vec::new();
     for rule in rule_list {
         violations.extend(rule.check_unit(unit));
@@ -468,7 +532,9 @@ fn check_one_file(
     semantic_old_ref: Option<&str>,
     root: &Path,
     encoding: &str,
+    timings: &Timings,
 ) -> FileCheck {
+    let t_read = Instant::now();
     let source = match read_source_file(file, encoding) {
         Ok(s) => s,
         Err(e) => {
@@ -479,6 +545,7 @@ fn check_one_file(
             };
         }
     };
+    Timings::add(&timings.read_ms, t_read);
 
     let rel_path = file
         .strip_prefix(root)
@@ -486,21 +553,18 @@ fn check_one_file(
         .to_string_lossy()
         .replace('\\', "/");
 
+    let t_parse = Instant::now();
     match parse_with_cache(parser, cache, &source, &rel_path) {
         Ok(mut unit) => {
+            Timings::add(&timings.parse_ms, t_parse);
             if unit.source_file.is_empty() {
                 unit.source_file = rel_path.clone();
             }
+            let t_rules = Instant::now();
             let mut violations = run_rules(&unit, rule_list);
             if let Some(old_ref) = semantic_old_ref {
                 let old_violations = collect_old_violations(
-                    &rel_path,
-                    old_ref,
-                    parser,
-                    cache,
-                    rule_list,
-                    root,
-                    encoding,
+                    &rel_path, old_ref, parser, cache, rule_list, root, encoding,
                 );
                 violations = match mapper {
                     Some(m) => semantic_difference(violations, old_violations, m),
@@ -508,27 +572,33 @@ fn check_one_file(
                 };
             } else if line_filter.is_incremental() {
                 let lf = line_filter;
-                violations = violations
-                    .into_iter()
-                    .filter(|v| lf.allows_policy(&rel_path, v.line, v.end_line, rule_policy(v, rule_list)))
-                    .collect();
+                violations.retain(|v| {
+                    lf.allows_policy(&rel_path, v.line, v.end_line, rule_policy(v, rule_list))
+                });
             }
+            Timings::add(&timings.rules_ms, t_rules);
             FileCheck {
                 violations,
                 parse_error: false,
                 error_msg: None,
             }
         }
-        Err(e) => FileCheck {
-            violations: Vec::new(),
-            parse_error: true,
-            error_msg: Some(format!("parse error: {rel_path} — {e}")),
-        },
+        Err(e) => {
+            Timings::add(&timings.parse_ms, t_parse);
+            FileCheck {
+                violations: Vec::new(),
+                parse_error: true,
+                error_msg: Some(format!("parse error: {rel_path} — {e}")),
+            }
+        }
     }
 }
 
 /// 找到某违规所属规则的 span_policy（按 id 匹配；找不到时用默认 Anchor）。
-fn rule_policy(v: &Violation, rule_list: &[Arc<dyn Rule<CompilationUnit>>]) -> guard_core::rule::SpanPolicy {
+fn rule_policy(
+    v: &Violation,
+    rule_list: &[Arc<dyn Rule<CompilationUnit>>],
+) -> guard_core::rule::SpanPolicy {
     rule_list
         .iter()
         .find(|r| r.id().0 == v.rule_id.0)
@@ -559,17 +629,19 @@ fn run_scan(
     config_path: &str,
     encoding: &str,
     no_cache: bool,
+    timings: bool,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
 
     if semantic_diff && diff.is_none() {
-        return Err(anyhow::anyhow!("--semantic-diff requires --diff (e.g. --diff HEAD~1)"));
+        return Err(anyhow::anyhow!(
+            "--semantic-diff requires --diff (e.g. --diff HEAD~1)"
+        ));
     }
 
     // 加载配置文件（如果存在）
     let project_config = load_project_config(config_path)?;
-    let report_format = ReportFormat::from_str(format)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let report_format = ReportFormat::from_str(format).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // 合并 encoding：CLI 参数优先于配置文件
     let effective_encoding = if encoding != "auto" {
@@ -586,25 +658,43 @@ fn run_scan(
     let enable_ids: Vec<String> = if enable_str.is_empty() {
         project_config.rules.enable.clone()
     } else {
-        enable_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        enable_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
     let disable_ids: Vec<String> = if disable_str.is_empty() {
         project_config.rules.disable.clone()
     } else {
-        disable_str.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+        disable_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     };
     let min_sev: guard_core::rule::Severity = if min_severity.is_empty() {
-        project_config.rules.min_severity.as_deref().unwrap_or("info").parse()
+        project_config
+            .rules
+            .min_severity
+            .as_deref()
+            .unwrap_or("info")
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid min_severity: {e}"))?
     } else {
-        min_severity.parse()
+        min_severity
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid min_severity: {e}"))?
     };
 
     // 默认排除目录
     let default_excludes = ["target", "build", ".git", "node_modules"];
     let mut excludes: Vec<String> = match exclude {
-        Some(e) => e.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Some(e) => e
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
         None => default_excludes.iter().map(|s| s.to_string()).collect(),
     };
     // 合并配置文件的 exclude
@@ -613,7 +703,11 @@ fn run_scan(
 
     // 路径白名单：CLI + 配置文件
     let includes: Vec<String> = match include {
-        Some(i) => i.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Some(i) => i
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
         None => project_config.scan.include.clone(),
     };
     let includes_ref: Vec<&str> = includes.iter().map(|s| s.as_str()).collect();
@@ -629,6 +723,7 @@ fn run_scan(
     let cache = AstCache::new(!no_cache, &parser_fingerprint(&jar_path)?);
 
     // 收集规则
+    let t_rules_load = Instant::now();
     let builtin = rules::builtin_rules();
     let mut rule_list: Vec<Arc<dyn Rule<CompilationUnit>>> = Vec::new();
 
@@ -636,9 +731,7 @@ fn run_scan(
     // - CLI --rules-file：相对当前工作目录（cwd）解析（CLI 参数惯例）
     // - 配置文件 rules_file：相对配置文件所在目录解析
     // - 默认 javaguard.rules.toml：相对 cwd
-    let config_dir = Path::new(config_path)
-        .parent()
-        .unwrap_or(Path::new("."));
+    let config_dir = Path::new(config_path).parent().unwrap_or(Path::new("."));
     let resolved_rules_file = if let Some(rf) = rules_file {
         PathBuf::from(rf)
     } else if let Some(rf) = &project_config.rules.rules_file {
@@ -663,9 +756,7 @@ fn run_scan(
     // 优先从 TOML 规则文件加载
     let loaded_from_toml = match load_rules_file(resolved_rules_file.to_str().unwrap_or("")) {
         Ok(entries) if !entries.is_empty() => {
-            let config_dir_for_rules = resolved_rules_file
-                .parent()
-                .unwrap_or(Path::new("."));
+            let config_dir_for_rules = resolved_rules_file.parent().unwrap_or(Path::new("."));
             for entry in &entries {
                 if let Some(r) = load_rule_from_entry(entry, config_dir_for_rules, &builtin) {
                     rule_list.push(r);
@@ -721,8 +812,10 @@ fn run_scan(
     rule_list.retain(|r| r.severity() >= min_sev);
 
     let enabled_count = rule_list.len();
+    let rules_load_ms = t_rules_load.elapsed().as_millis() as u64;
 
     // 扫描文件
+    let t_traverse = Instant::now();
     let root = Path::new(path);
     let scan_result = scanner::scan_java_files(root, &excludes_ref);
 
@@ -730,17 +823,27 @@ fn run_scan(
     let scan_files = if includes_ref.is_empty() {
         scan_result.files.clone()
     } else {
-        scan_result.files.iter().filter(|f| {
-            let f_str = f.to_string_lossy().replace('\\', "/");
-            includes_ref.iter().any(|inc| {
-                let inc = inc.replace('\\', "/");
-                f_str.contains(&inc)
+        scan_result
+            .files
+            .iter()
+            .filter(|f| {
+                let f_str = f.to_string_lossy().replace('\\', "/");
+                includes_ref.iter().any(|inc| {
+                    let inc = inc.replace('\\', "/");
+                    f_str.contains(&inc)
+                })
             })
-        }).cloned().collect()
+            .cloned()
+            .collect()
     };
-    let scan_result = scanner::ScanResult { files: scan_files, root: scan_result.root };
+    let scan_result = scanner::ScanResult {
+        files: scan_files,
+        root: scan_result.root,
+    };
+    let traverse_ms = t_traverse.elapsed().as_millis() as u64;
 
     // M5: 增量扫描 — git diff 过滤
+    let t_diff = Instant::now();
     let mut line_mapper: Option<git_diff::LineMapper> = None;
     let line_filter = if let Some(diff_spec) = diff {
         match git_diff::get_diff(root, diff_spec) {
@@ -787,14 +890,7 @@ fn run_scan(
                         abs
                     };
                 }
-                
-                
-                
-                
-                
-                
-                
-                
+
                 let diff_files: std::collections::HashSet<String> =
                     diffs.iter().map(|d| d.path.clone()).collect();
                 let filtered: Vec<PathBuf> = scan_result
@@ -828,6 +924,7 @@ fn run_scan(
     } else {
         (scan_result.files.clone(), git_diff::LineFilter::all())
     };
+    let diff_ms = t_diff.elapsed().as_millis() as u64;
 
     // 语义对比模式：解析 diff 规格的「旧侧」引用
     let semantic_old_ref: Option<String> = if semantic_diff {
@@ -850,11 +947,12 @@ fn run_scan(
         enabled_count
     );
 
-    // 解析器选择：优先 DaemonParser 实例池（避免每文件启动 JVM），失败时回退 CliParser。
+    // 解析器选择：LazyParser 首次真实解析（缓存 miss）时才启动 daemon 池，
+    // AST 缓存全命中的增量扫描零 JVM 启动成本；池启动失败自动回退 per-file JVM 并显眼告警。
     // 池大小 = min(CPU 核数, 4, 文件数)，常驻 JVM 内存约 32-512MB/个。
     // 可通过环境变量 JAVAGUARD_PARSER_MODE=cli 强制使用单次模式（调试/对比用）。
     let n_files = line_filter.0.len();
-    let force_cli = std::env::var("JAVAGUARD_PARSER_MODE").map_or(false, |m| m.eq_ignore_ascii_case("cli"));
+    let force_cli = std::env::var("JAVAGUARD_PARSER_MODE").is_ok_and(|m| m.eq_ignore_ascii_case("cli"));
     let java_cmd = java_cmd
         .map(|c| c.to_string())
         .or_else(|| std::env::var("JAVA_CMD").ok())
@@ -863,30 +961,19 @@ fn run_scan(
         let pool_size = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .min(4)
-            .min(n_files)
-            .max(1);
-        match DaemonPool::start(&jar_path, &java_cmd, pool_size) {
-            Ok(pool) => {
-                eprintln!("Parser: daemon pool ({pool_size} resident JVM(s))");
-                Arc::new(pool)
-            }
-            Err(e) => {
-                eprintln!(
-                    "warn: daemon parser unavailable ({e}), falling back to per-file JVM (slower)"
-                );
-                Arc::new(cli_parser)
-            }
-        }
+            .clamp(1, n_files.min(4));
+        Arc::new(LazyParser::new(&jar_path, &java_cmd, pool_size))
     } else {
         Arc::new(cli_parser)
     };
 
-    // 解析 + 检查（并行，受 CPU 核数限制；daemon 池内部轮询，无冲突风险）
+    // 解析 + 检查（并行，受 CPU 核数限制；daemon 池按实例加锁，无冲突风险）
     let mut collector = ViolationCollector::new();
+    let timings_stat = Timings::default();
     let parsed = std::sync::atomic::AtomicUsize::new(0);
     let parse_errors = std::sync::atomic::AtomicUsize::new(0);
 
+    let t_check = Instant::now();
     let results: Vec<FileCheck> = {
         let files = &line_filter.0;
         if files.is_empty() {
@@ -895,9 +982,7 @@ fn run_scan(
             let n_workers = thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
-                .min(files.len())
-                .min(8)
-                .max(1);
+                .clamp(1, files.len().min(8));
             let collected: Mutex<Vec<FileCheck>> = Mutex::new(Vec::with_capacity(files.len()));
             thread::scope(|s| {
                 for w in 0..n_workers {
@@ -911,6 +996,7 @@ fn run_scan(
                     let root = &scan_result.root;
                     let parsed = &parsed;
                     let parse_errors = &parse_errors;
+                    let timings = &timings_stat;
                     let encoding = effective_encoding;
                     s.spawn(move || {
                         for idx in (w..files.len()).step_by(n_workers) {
@@ -924,6 +1010,7 @@ fn run_scan(
                                 old_ref.as_deref(),
                                 root,
                                 encoding,
+                                timings,
                             );
                             if check.parse_error {
                                 parse_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -941,6 +1028,7 @@ fn run_scan(
             collected.into_inner().unwrap()
         }
     };
+    let check_ms = t_check.elapsed().as_millis() as u64;
 
     for check in results {
         collector.add_all(check.violations);
@@ -964,7 +1052,8 @@ fn run_scan(
             Ok(entries) => {
                 let before = collector.count();
                 let filtered = if let Some(mapper) = &line_mapper {
-                    let f = filter_baseline_mapped(collector.violations().to_vec(), &entries, mapper);
+                    let f =
+                        filter_baseline_mapped(collector.violations().to_vec(), &entries, mapper);
                     eprintln!(
                         "Baseline: {} of {} violations are new (mapped by diff hunks)",
                         f.len(),
@@ -998,7 +1087,8 @@ fn run_scan(
     // 排序
     let mut violations = violations;
     violations.sort_by(|a, b| {
-        a.file.cmp(&b.file)
+        a.file
+            .cmp(&b.file)
             .then(a.line.cmp(&b.line))
             .then(a.rule_id.cmp(&b.rule_id))
     });
@@ -1009,6 +1099,7 @@ fn run_scan(
     }
 
     // 输出报告
+    let t_report = Instant::now();
     match output {
         Some(out_path) => {
             let mut file = std::fs::File::create(out_path)?;
@@ -1032,6 +1123,22 @@ fn run_scan(
                 Some(duration_ms),
             )?;
         }
+    }
+    let report_ms = t_report.elapsed().as_millis() as u64;
+
+    if timings {
+        let read_ms = timings_stat
+            .read_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let parse_ms = timings_stat
+            .parse_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let rules_ms = timings_stat
+            .rules_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "Timings: total {duration_ms} ms | rules-load {rules_load_ms} | traverse {traverse_ms} | diff {diff_ms} | check {check_ms} (Σ read {read_ms} / Σ parse {parse_ms} / Σ rules {rules_ms}, Σ across workers) | report {report_ms}"
+        );
     }
 
     // M7: CI Gate 检查
@@ -1068,8 +1175,8 @@ fn run_scan(
 /// 条目形如 `{"file": "A.java", "line": 10, "rule_id": "J001"}`。
 fn load_baseline(path: &str) -> anyhow::Result<Vec<(String, usize, String)>> {
     let content = std::fs::read_to_string(path)?;
-    let baseline: Vec<serde_json::Value> = serde_json::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("parse baseline JSON: {e}"))?;
+    let baseline: Vec<serde_json::Value> =
+        serde_json::from_str(&content).map_err(|e| anyhow::anyhow!("parse baseline JSON: {e}"))?;
 
     let mut list = Vec::with_capacity(baseline.len());
     for v in &baseline {
@@ -1107,7 +1214,9 @@ fn resolve_old_ref(repo_root: &Path, diff_spec: &str) -> anyhow::Result<String> 
             .output()
             .map_err(|e| anyhow::anyhow!("failed to run git merge-base {a} {b}: {e}"))?;
         if !out.status.success() {
-            return Err(anyhow::anyhow!("git merge-base {a} {b} failed (no common ancestor?)"));
+            return Err(anyhow::anyhow!(
+                "git merge-base {a} {b} failed (no common ancestor?)"
+            ));
         }
         return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
     }
@@ -1158,7 +1267,7 @@ fn filter_baseline(
                     continue;
                 }
                 let dist = (*bl as i64 - v.line as i64).unsigned_abs();
-                if dist <= tolerance as u64 && best.map_or(true, |(d, _)| dist < d) {
+                if dist <= tolerance as u64 && best.is_none_or(|(d, _)| dist < d) {
                     best = Some((dist, i));
                 }
             }
@@ -1182,11 +1291,7 @@ fn parser_fingerprint(jar: &Path) -> anyhow::Result<String> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    Ok(format!(
-        "{}|{}|{mtime_ns}",
-        jar.display(),
-        meta.len()
-    ))
+    Ok(format!("{}|{}|{mtime_ns}", jar.display(), meta.len()))
 }
 
 /// 查找 java-parser.jar。
@@ -1214,7 +1319,8 @@ fn find_parser_jar(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
             }
         }
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("java-parser/target/java-parser.jar"));
+    candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("java-parser/target/java-parser.jar"));
 
     for c in &candidates {
         if c.exists() {
@@ -1324,10 +1430,10 @@ fn load_project_config(path: &str) -> anyhow::Result<ProjectConfig> {
     if !p.exists() {
         return Ok(ProjectConfig::default());
     }
-    let content = std::fs::read_to_string(p)
-        .map_err(|e| anyhow::anyhow!("read config {path}: {e}"))?;
-    let cfg: ProjectConfig = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("parse config {path}: {e}"))?;
+    let content =
+        std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("read config {path}: {e}"))?;
+    let cfg: ProjectConfig =
+        toml::from_str(&content).map_err(|e| anyhow::anyhow!("parse config {path}: {e}"))?;
     Ok(cfg)
 }
 
@@ -1339,10 +1445,10 @@ fn load_rules_file(path: &str) -> anyhow::Result<Vec<RuleEntry>> {
     if !p.exists() {
         return Ok(Vec::new());
     }
-    let content = std::fs::read_to_string(p)
-        .map_err(|e| anyhow::anyhow!("read rules file {path}: {e}"))?;
-    let file: RulesFile = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("parse rules file {path}: {e}"))?;
+    let content =
+        std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("read rules file {path}: {e}"))?;
+    let file: RulesFile =
+        toml::from_str(&content).map_err(|e| anyhow::anyhow!("parse rules file {path}: {e}"))?;
     // 校验 rule ID 唯一性
     let mut seen = std::collections::HashSet::new();
     for rule in &file.rules {
@@ -1381,7 +1487,11 @@ fn load_rule_from_entry(
     };
 
     if !resolved.exists() {
-        eprintln!("warn: rule {} script not found: {}", entry.id, resolved.display());
+        eprintln!(
+            "warn: rule {} script not found: {}",
+            entry.id,
+            resolved.display()
+        );
         return None;
     }
 
@@ -1447,7 +1557,10 @@ fn load_rule_from_entry(
             }
         },
         _ => {
-            eprintln!("warn: skip rule {}: unsupported file extension '{}'", entry.id, ext);
+            eprintln!(
+                "warn: skip rule {}: unsupported file extension '{}'",
+                entry.id, ext
+            );
             None
         }
     }
@@ -1466,10 +1579,7 @@ fn toml_value_to_yaml(v: &toml::Value) -> serde_yaml::Value {
         toml::Value::Table(map) => {
             let mut yaml_map = serde_yaml::Mapping::new();
             for (k, v) in map {
-                yaml_map.insert(
-                    serde_yaml::Value::String(k.clone()),
-                    toml_value_to_yaml(v),
-                );
+                yaml_map.insert(serde_yaml::Value::String(k.clone()), toml_value_to_yaml(v));
             }
             serde_yaml::Value::Mapping(yaml_map)
         }
@@ -1589,7 +1699,10 @@ exclude = ["build"]
 "#;
         std::fs::write(&path, toml_content).unwrap();
         let cfg = load_project_config(path.to_str().unwrap()).unwrap();
-        assert_eq!(cfg.rules.enable, vec!["J001".to_string(), "J003".to_string()]);
+        assert_eq!(
+            cfg.rules.enable,
+            vec!["J001".to_string(), "J003".to_string()]
+        );
         assert_eq!(cfg.rules.disable, vec!["J008".to_string()]);
         assert_eq!(cfg.rules.min_severity.as_deref(), Some("major"));
         assert_eq!(cfg.scan.include, vec!["src/main".to_string()]);
@@ -1764,10 +1877,15 @@ script_path = "y.yml"
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("gbk.java");
         // GBK 编码的中文注释："// 测试中文"
-        let gbk_bytes = vec![0x2F, 0x2F, 0x20, 0xB2, 0xE2, 0xCA, 0xD4, 0xD6, 0xD0, 0xCE, 0xC4];
+        let gbk_bytes = vec![
+            0x2F, 0x2F, 0x20, 0xB2, 0xE2, 0xCA, 0xD4, 0xD6, 0xD0, 0xCE, 0xC4,
+        ];
         std::fs::write(&path, &gbk_bytes).unwrap();
         let s = read_source_file(&path, "auto").unwrap();
-        assert!(s.contains("测试"), "auto-detect should decode GBK to readable Chinese, got: {s:?}");
+        assert!(
+            s.contains("测试"),
+            "auto-detect should decode GBK to readable Chinese, got: {s:?}"
+        );
         // 显式指定 GBK
         let s2 = read_source_file(&path, "gbk").unwrap();
         assert!(s2.contains("测试"));
@@ -1825,7 +1943,13 @@ script_path = "y.yml"
             new_start: 8,
             new_len: 3,
         }]);
-        let old_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 12, "x")];
+        let old_vs = vec![Violation::new(
+            "J001",
+            Severity::Minor,
+            "src/A.java",
+            12,
+            "x",
+        )];
         let new_vs = vec![
             Violation::new("J001", Severity::Minor, "src/A.java", 15, "x"), // 已知
             Violation::new("J001", Severity::Minor, "src/A.java", 30, "x"), // 新增
@@ -1838,7 +1962,13 @@ script_path = "y.yml"
     #[test]
     fn semantic_difference_keeps_new_violations() {
         let mapper = mapper_with_hunks(vec![]);
-        let old_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 10, "x")];
+        let old_vs = vec![Violation::new(
+            "J001",
+            Severity::Minor,
+            "src/A.java",
+            10,
+            "x",
+        )];
         let new_vs = vec![
             Violation::new("J001", Severity::Minor, "src/A.java", 11, "x"), // 行号变了
             Violation::new("J003", Severity::Minor, "src/A.java", 10, "x"), // 规则变了
@@ -1856,8 +1986,20 @@ script_path = "y.yml"
             new_start: 5,
             new_len: 0,
         }]);
-        let old_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 6, "x")];
-        let new_vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 5, "x")];
+        let old_vs = vec![Violation::new(
+            "J001",
+            Severity::Minor,
+            "src/A.java",
+            6,
+            "x",
+        )];
+        let new_vs = vec![Violation::new(
+            "J001",
+            Severity::Minor,
+            "src/A.java",
+            5,
+            "x",
+        )];
         let kept = semantic_difference(new_vs, old_vs, &mapper);
         assert_eq!(kept.len(), 1);
     }
@@ -1891,16 +2033,31 @@ script_path = "y.yml"
             new_len: 0,
         }]);
         let baseline = vec![("src/A.java".to_string(), 11, "J001".to_string())];
-        let vs = vec![Violation::new("J001", Severity::Minor, "src/A.java", 11, "x")];
+        let vs = vec![Violation::new(
+            "J001",
+            Severity::Minor,
+            "src/A.java",
+            11,
+            "x",
+        )];
         let kept = filter_baseline_mapped(vs, &baseline, &mapper);
         assert_eq!(kept.len(), 1);
     }
 
     #[test]
     fn resolve_old_ref_forms() {
-        assert_eq!(resolve_old_ref(std::path::Path::new("."), "HEAD~1").unwrap(), "HEAD~1");
-        assert_eq!(resolve_old_ref(std::path::Path::new("."), "main..feature").unwrap(), "main");
-        assert_eq!(resolve_old_ref(std::path::Path::new("."), "v1.0").unwrap(), "v1.0");
+        assert_eq!(
+            resolve_old_ref(std::path::Path::new("."), "HEAD~1").unwrap(),
+            "HEAD~1"
+        );
+        assert_eq!(
+            resolve_old_ref(std::path::Path::new("."), "main..feature").unwrap(),
+            "main"
+        );
+        assert_eq!(
+            resolve_old_ref(std::path::Path::new("."), "v1.0").unwrap(),
+            "v1.0"
+        );
     }
 
     #[test]
@@ -2025,9 +2182,7 @@ message: "x"
 "#,
         )
         .unwrap();
-        assert!(
-            load_rule_from_entry(&rule_entry("IMPCTX", "import_ctx.yml"), &dir, &[]).is_none()
-        );
+        assert!(load_rule_from_entry(&rule_entry("IMPCTX", "import_ctx.yml"), &dir, &[]).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

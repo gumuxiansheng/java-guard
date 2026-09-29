@@ -68,16 +68,24 @@ fn check_member(m: &MemberDecl, file: &str, out: &mut Vec<Violation>) {
             }
         }
         MemberDecl::ClassDeclaration(c) => {
-            for m in &c.members { check_member(m, file, out); }
+            for m in &c.members {
+                check_member(m, file, out);
+            }
         }
         MemberDecl::InterfaceDeclaration(i) => {
-            for m in &i.members { check_member(m, file, out); }
+            for m in &i.members {
+                check_member(m, file, out);
+            }
         }
         MemberDecl::EnumDeclaration(e) => {
-            for m in &e.members { check_member(m, file, out); }
+            for m in &e.members {
+                check_member(m, file, out);
+            }
         }
         MemberDecl::AnnotationDeclaration(a) => {
-            for m in &a.members { check_member(m, file, out); }
+            for m in &a.members {
+                check_member(m, file, out);
+            }
         }
         _ => {}
     }

@@ -51,10 +51,7 @@ impl Rule<CompilationUnit> for RhaiRuleAdapter {
         match run_cached(&self.rule, unit, file) {
             Ok(vs) => vs,
             Err(e) => {
-                eprintln!(
-                    "warn: rhai rule {} failed on {}: {e}",
-                    self.rule.id, file
-                );
+                eprintln!("warn: rhai rule {} failed on {}: {e}", self.rule.id, file);
                 vec![]
             }
         }
@@ -108,7 +105,10 @@ mod tests {
         let mut rule = test_rule("[]");
         rule.span_policy = guard_core::rule::SpanPolicy::Intersect;
         let adapter = RhaiRuleAdapter::new(rule);
-        assert_eq!(adapter.span_policy(), guard_core::rule::SpanPolicy::Intersect);
+        assert_eq!(
+            adapter.span_policy(),
+            guard_core::rule::SpanPolicy::Intersect
+        );
     }
 
     #[test]

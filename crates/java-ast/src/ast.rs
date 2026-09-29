@@ -88,8 +88,6 @@ pub struct ClassDecl {
     pub end_line: usize,
 }
 
-/// 接口声明。
-
 /// 枚举声明。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnumDecl {

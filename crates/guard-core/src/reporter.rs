@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::rule::{Severity, Violation};
 
 /// 支持的报告格式。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportFormat {
     /// 控制台彩色输出
+    #[default]
     Console,
     /// JSON 格式
     Json,
@@ -20,12 +21,6 @@ pub enum ReportFormat {
     Sarif,
     /// CSV 格式
     Csv,
-}
-
-impl Default for ReportFormat {
-    fn default() -> Self {
-        ReportFormat::Console
-    }
 }
 
 impl std::str::FromStr for ReportFormat {
@@ -277,8 +272,7 @@ impl JsonReporter {
             violations: violations.to_vec(),
             stats,
         };
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
         writeln!(w, "{json}")?;
         Ok(())
     }
@@ -374,7 +368,7 @@ impl SarifReporter {
     ) -> io::Result<()> {
         let sarif = Self::build_sarif(violations);
         let json = serde_json::to_string_pretty(&sarif)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         writeln!(w, "{json}")?;
         Ok(())
     }

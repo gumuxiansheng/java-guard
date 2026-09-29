@@ -240,7 +240,7 @@ violations
         // params 解析
         match &rule.params {
             serde_yaml::Value::Mapping(m) => {
-                assert_eq!(m.get(&serde_yaml::Value::String("max_lines".into())),
+                assert_eq!(m.get(serde_yaml::Value::String("max_lines".into())),
                     Some(&serde_yaml::Value::Number(50.into())));
             }
             _ => panic!("expected mapping"),
@@ -264,19 +264,19 @@ violations
 
     #[test]
     fn parse_rhai_script_params_types() {
-        let script = "//! rule: J100\n//! params: max_lines=50,enabled=true,name=foo,pi=3.14\nlet x = 1;";
+        let script = "//! rule: J100\n//! params: max_lines=50,enabled=true,name=foo,pi=2.5\nlet x = 1;";
         let rule = parse_rhai_script(script).unwrap();
         match &rule.params {
             serde_yaml::Value::Mapping(m) => {
-                assert_eq!(m.get(&serde_yaml::Value::String("max_lines".into())),
+                assert_eq!(m.get(serde_yaml::Value::String("max_lines".into())),
                     Some(&serde_yaml::Value::Number(50.into())));
-                assert_eq!(m.get(&serde_yaml::Value::String("enabled".into())),
+                assert_eq!(m.get(serde_yaml::Value::String("enabled".into())),
                     Some(&serde_yaml::Value::Bool(true)));
-                assert_eq!(m.get(&serde_yaml::Value::String("name".into())),
+                assert_eq!(m.get(serde_yaml::Value::String("name".into())),
                     Some(&serde_yaml::Value::String("foo".into())));
-                // pi=3.14 -> f64
-                if let Some(serde_yaml::Value::Number(n)) = m.get(&serde_yaml::Value::String("pi".into())) {
-                    assert!((n.as_f64().unwrap() - 3.14).abs() < 0.001);
+                // pi=2.5 -> f64
+                if let Some(serde_yaml::Value::Number(n)) = m.get(serde_yaml::Value::String("pi".into())) {
+                    assert!((n.as_f64().unwrap() - 2.5).abs() < 0.001);
                 } else { panic!("expected number"); }
             }
             _ => panic!("expected mapping"),

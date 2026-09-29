@@ -79,16 +79,24 @@ fn check_member(m: &MemberDecl, file: &str, out: &mut Vec<Violation>) {
             }
         }
         MemberDecl::ClassDeclaration(c) => {
-            for m in &c.members { check_member(m, file, out); }
+            for m in &c.members {
+                check_member(m, file, out);
+            }
         }
         MemberDecl::InterfaceDeclaration(i) => {
-            for m in &i.members { check_member(m, file, out); }
+            for m in &i.members {
+                check_member(m, file, out);
+            }
         }
         MemberDecl::EnumDeclaration(e) => {
-            for m in &e.members { check_member(m, file, out); }
+            for m in &e.members {
+                check_member(m, file, out);
+            }
         }
         MemberDecl::AnnotationDeclaration(a) => {
-            for m in &a.members { check_member(m, file, out); }
+            for m in &a.members {
+                check_member(m, file, out);
+            }
         }
         _ => {}
     }
@@ -162,7 +170,10 @@ fn stmt_contains_throw(stmt: &Stmt) -> bool {
         Stmt::IfStmt(is) => {
             expr_contains_throw(&is.condition)
                 || stmt_contains_throw(&is.then_stmt)
-                || is.else_stmt.as_ref().is_some_and(|s| stmt_contains_throw(s))
+                || is
+                    .else_stmt
+                    .as_ref()
+                    .is_some_and(|s| stmt_contains_throw(s))
         }
         Stmt::ForStmt(fs) => {
             fs.initialization.as_ref().is_some_and(expr_contains_throw)
@@ -179,7 +190,10 @@ fn stmt_contains_throw(stmt: &Stmt) -> bool {
         Stmt::DoStmt(ds) => stmt_contains_throw(&ds.body) || expr_contains_throw(&ds.condition),
         Stmt::TryStmt(ts) => {
             block_contains_throw(&ts.try_body)
-                || ts.catch_clauses.iter().any(|cc| block_contains_throw(&cc.body))
+                || ts
+                    .catch_clauses
+                    .iter()
+                    .any(|cc| block_contains_throw(&cc.body))
                 || ts.finally_body.as_ref().is_some_and(block_contains_throw)
         }
         Stmt::BlockStmt(b) => block_contains_throw(b),
@@ -202,9 +216,7 @@ fn expr_contains_throw(expr: &Expr) -> bool {
         Expr::LambdaExpr(le) => stmt_contains_throw(&le.body),
         Expr::MethodCallExpr(mc) => mc.arguments.iter().any(expr_contains_throw),
         Expr::ObjectCreationExpr(oc) => oc.arguments.iter().any(expr_contains_throw),
-        Expr::AssignExpr(ae) => {
-            expr_contains_throw(&ae.target) || expr_contains_throw(&ae.value)
-        }
+        Expr::AssignExpr(ae) => expr_contains_throw(&ae.target) || expr_contains_throw(&ae.value),
         Expr::BinaryExpr(be) => expr_contains_throw(&be.left) || expr_contains_throw(&be.right),
         Expr::UnaryExpr(ue) => expr_contains_throw(&ue.expr),
         Expr::ConditionalExpr(ce) => {
@@ -264,7 +276,10 @@ fn stmt_contains_log(stmt: &Stmt) -> bool {
         Stmt::ThrowStmt(ts) => expr_contains_log(&ts.expr),
         Stmt::TryStmt(ts) => {
             block_contains_log(&ts.try_body)
-                || ts.catch_clauses.iter().any(|cc| block_contains_log(&cc.body))
+                || ts
+                    .catch_clauses
+                    .iter()
+                    .any(|cc| block_contains_log(&cc.body))
                 || ts.finally_body.as_ref().is_some_and(block_contains_log)
         }
         Stmt::BlockStmt(b) => block_contains_log(b),
@@ -275,23 +290,17 @@ fn stmt_contains_log(stmt: &Stmt) -> bool {
                         || c.statements.iter().any(stmt_contains_log)
                 })
         }
-        Stmt::SynchronizedStmt(ss) => {
-            expr_contains_log(&ss.expr) || block_contains_log(&ss.body)
-        }
+        Stmt::SynchronizedStmt(ss) => expr_contains_log(&ss.expr) || block_contains_log(&ss.body),
         _ => false,
     }
 }
 
 fn expr_contains_log(expr: &Expr) -> bool {
     match expr {
-        Expr::MethodCallExpr(mc) => {
-            is_log_call(mc) || mc.arguments.iter().any(expr_contains_log)
-        }
+        Expr::MethodCallExpr(mc) => is_log_call(mc) || mc.arguments.iter().any(expr_contains_log),
         Expr::LambdaExpr(le) => stmt_contains_log(&le.body),
         Expr::ObjectCreationExpr(oc) => oc.arguments.iter().any(expr_contains_log),
-        Expr::AssignExpr(ae) => {
-            expr_contains_log(&ae.target) || expr_contains_log(&ae.value)
-        }
+        Expr::AssignExpr(ae) => expr_contains_log(&ae.target) || expr_contains_log(&ae.value),
         Expr::BinaryExpr(be) => expr_contains_log(&be.left) || expr_contains_log(&be.right),
         Expr::UnaryExpr(ue) => expr_contains_log(&ue.expr),
         Expr::ConditionalExpr(ce) => {
@@ -302,9 +311,7 @@ fn expr_contains_log(expr: &Expr) -> bool {
         Expr::EnclosedExpr { inner, .. } => expr_contains_log(inner),
         Expr::CastExpr(ce) => expr_contains_log(&ce.expr),
         Expr::FieldAccessExpr(fa) => expr_contains_log(&fa.target),
-        Expr::ArrayAccessExpr(aa) => {
-            expr_contains_log(&aa.array) || expr_contains_log(&aa.index)
-        }
+        Expr::ArrayAccessExpr(aa) => expr_contains_log(&aa.array) || expr_contains_log(&aa.index),
         Expr::ArrayCreationExpr(ac) => ac.initializer.iter().any(expr_contains_log),
         Expr::VariableDeclarationExpr(vde) => vde
             .declarations
@@ -365,7 +372,11 @@ mod tests {
     fn try_with_catch(catch_statements: Vec<Stmt>) -> Stmt {
         Stmt::TryStmt(TryStmt {
             resources: vec![],
-            try_body: BlockStmt { statements: vec![], line: 1, end_line: 2 },
+            try_body: BlockStmt {
+                statements: vec![],
+                line: 1,
+                end_line: 2,
+            },
             catch_clauses: vec![CatchClause {
                 exception_type: Some("Exception".to_string()),
                 exception_name: Some("e".to_string()),
@@ -384,7 +395,10 @@ mod tests {
     #[test]
     fn detects_silent_rethrow() {
         let unit = unit_with_method(vec![try_with_catch(vec![Stmt::ThrowStmt(ThrowStmt {
-            expr: Expr::NameExpr(NameExpr { name: "e".to_string(), line: 4 }),
+            expr: Expr::NameExpr(NameExpr {
+                name: "e".to_string(),
+                line: 4,
+            }),
             line: 4,
         })])]);
         let vs = ThrowMustLogRule::new().check_unit(&unit);
@@ -406,7 +420,10 @@ mod tests {
                 line: 4,
             }),
             Stmt::ThrowStmt(ThrowStmt {
-                expr: Expr::NameExpr(NameExpr { name: "e".to_string(), line: 5 }),
+                expr: Expr::NameExpr(NameExpr {
+                    name: "e".to_string(),
+                    line: 5,
+                }),
                 line: 5,
             }),
         ];
@@ -436,7 +453,10 @@ mod tests {
                 line: 4,
             }),
             Stmt::ThrowStmt(ThrowStmt {
-                expr: Expr::NameExpr(NameExpr { name: "e".to_string(), line: 5 }),
+                expr: Expr::NameExpr(NameExpr {
+                    name: "e".to_string(),
+                    line: 5,
+                }),
                 line: 5,
             }),
         ];
@@ -459,7 +479,10 @@ mod tests {
                 line: 4,
             }),
             Stmt::ThrowStmt(ThrowStmt {
-                expr: Expr::NameExpr(NameExpr { name: "e".to_string(), line: 5 }),
+                expr: Expr::NameExpr(NameExpr {
+                    name: "e".to_string(),
+                    line: 5,
+                }),
                 line: 5,
             }),
         ];
@@ -472,7 +495,10 @@ mod tests {
     fn throw_outside_catch_is_not_reported() {
         // 方法体直接 throw（如参数校验），不在本规则范围
         let unit = unit_with_method(vec![Stmt::ThrowStmt(ThrowStmt {
-            expr: Expr::NameExpr(NameExpr { name: "x".to_string(), line: 2 }),
+            expr: Expr::NameExpr(NameExpr {
+                name: "x".to_string(),
+                line: 2,
+            }),
             line: 2,
         })]);
         let vs = ThrowMustLogRule::new().check_unit(&unit);
@@ -488,7 +514,10 @@ mod tests {
                 line: 4,
             }),
             then_stmt: Box::new(Stmt::ThrowStmt(ThrowStmt {
-                expr: Expr::NameExpr(NameExpr { name: "e".to_string(), line: 5 }),
+                expr: Expr::NameExpr(NameExpr {
+                    name: "e".to_string(),
+                    line: 5,
+                }),
                 line: 5,
             })),
             else_stmt: None,

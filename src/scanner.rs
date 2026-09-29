@@ -70,8 +70,16 @@ mod tests {
         fs::create_dir_all(tmp.join("src/main/java/com/example")).unwrap();
         fs::create_dir_all(tmp.join("target")).unwrap();
 
-        fs::write(tmp.join("src/main/java/com/example/Foo.java"), "class Foo {}").unwrap();
-        fs::write(tmp.join("src/main/java/com/example/Bar.java"), "class Bar {}").unwrap();
+        fs::write(
+            tmp.join("src/main/java/com/example/Foo.java"),
+            "class Foo {}",
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("src/main/java/com/example/Bar.java"),
+            "class Bar {}",
+        )
+        .unwrap();
         fs::write(tmp.join("target/Generated.java"), "class Generated {}").unwrap();
         fs::write(tmp.join("README.md"), "# readme").unwrap();
 

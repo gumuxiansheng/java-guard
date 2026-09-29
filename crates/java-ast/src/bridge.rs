@@ -9,7 +9,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use crate::ast::CompilationUnit;
 use crate::error::ParseError;
@@ -25,6 +27,12 @@ pub const DAEMON_JVM_ARGS: &[&str] = &[
     "-Xms32m",
     "-Xmx512m",
 ];
+
+/// CLI 回退模式的 JVM 参数（与 daemon 相同）。
+///
+/// 不设 `-Xmx` 时，并发 JVM 各默认预留 1/4 物理内存，8 worker 并发下
+/// 实测出现 `Could not create the Java Virtual Machine`（605 文件 201 个解析失败）。
+pub const CLI_JVM_ARGS: &[&str] = DAEMON_JVM_ARGS;
 
 /// Java 解析器接口。
 ///
@@ -70,6 +78,7 @@ impl JavaParser for CliParser {
         std::fs::write(&tmp_file, source)?;
 
         let output = Command::new(&self.java_cmd)
+            .args(CLI_JVM_ARGS)
             .args(["-jar"])
             .arg(&self.jar_path)
             .args(["--input"])
@@ -134,27 +143,54 @@ impl DaemonParser {
         })
     }
 
+    /// 启动常驻 JVM，spawn 失败时带退避重试。
+    ///
+    /// Windows 上 `ERROR_PIPE_BUSY`（os error 231）为瞬态错误，官方文档即建议
+    /// 稍候重试；单次失败不再等于该实例永远起不来。
+    pub fn start_with_retry(
+        jar_path: &Path,
+        java_cmd: &str,
+        attempts: u32,
+    ) -> Result<Self, ParseError> {
+        let attempts = attempts.max(1);
+        let mut last = None;
+        for attempt in 1..=attempts {
+            match DaemonParser::start(jar_path, java_cmd) {
+                Ok(p) => return Ok(p),
+                Err(e) => {
+                    last = Some(e);
+                    if attempt < attempts {
+                        std::thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                    }
+                }
+            }
+        }
+        Err(last.expect("attempts >= 1"))
+    }
+
     /// 发送一个 JSON 请求并读取一行 JSON 响应。
     fn request(&self, request: &serde_json::Value) -> Result<serde_json::Value, ParseError> {
         let mut line = serde_json::to_string(request)?;
         line.push('\n');
 
-        let mut stdin = self.stdin.lock().map_err(|_| {
-            ParseError::ParserError("daemon stdin lock poisoned".to_string())
-        })?;
+        let mut stdin = self
+            .stdin
+            .lock()
+            .map_err(|_| ParseError::ParserError("daemon stdin lock poisoned".to_string()))?;
         stdin
             .write_all(line.as_bytes())
             .and_then(|_| stdin.flush())
-            .map_err(|e| ParseError::IoError(e))?;
+            .map_err(ParseError::IoError)?;
         drop(stdin);
 
-        let mut stdout = self.stdout.lock().map_err(|_| {
-            ParseError::ParserError("daemon stdout lock poisoned".to_string())
-        })?;
+        let mut stdout = self
+            .stdout
+            .lock()
+            .map_err(|_| ParseError::ParserError("daemon stdout lock poisoned".to_string()))?;
         let mut response = String::new();
         let read = stdout
             .read_line(&mut response)
-            .map_err(|e| ParseError::IoError(e))?;
+            .map_err(ParseError::IoError)?;
         if read == 0 {
             // JVM 提前退出（如被外部杀死或启动失败）
             return Err(ParseError::ParserError(
@@ -214,52 +250,88 @@ impl JavaParser for DaemonParser {
 
 /// 常驻 JVM 实例池：并行解析时多个 worker 轮流使用多个 daemon。
 ///
-/// 某个 daemon 异常退出（管道断裂）时自动重启并重试一次，避免整批文件解析失败。
+/// 锁粒度是**单个 daemon**（`Vec<Mutex<DaemonParser>>`），不是整池：
+/// worker 只在自己分到的 daemon 上持锁，IPC 往返期间其余 daemon 可并行服务
+/// （整池一把锁会跨往返串行化所有解析，实测比单 daemon 还慢 41%）。
+///
+/// - 启动时并行 spawn 全部实例（串行会把池启动时间放大为 size 倍 JVM 启动耗时）；
+/// - 单实例 spawn 失败带重试；部分失败降级为「用剩下的实例」并显眼告警；
+/// - 仅当全部实例失败才返回 Err（由调用方决定回退 CLI 模式）；
+/// - 某个 daemon 运行中异常退出（管道断裂）时自动重启并重试一次。
 pub struct DaemonPool {
     jar_path: PathBuf,
     java_cmd: String,
-    /// 实例个数（设计文档建议 2-4 个）。
-    daemons: Mutex<Vec<DaemonParser>>,
+    daemons: Vec<Mutex<DaemonParser>>,
     next: AtomicUsize,
 }
 
 impl DaemonPool {
-    /// 启动 `size` 个常驻 JVM。任一实例启动失败即整体失败（由调用方决定回退到 CLI 模式）。
+    /// 启动 `size` 个常驻 JVM（并行 spawn，各自带重试）。
     pub fn start(jar_path: &Path, java_cmd: &str, size: usize) -> Result<Self, ParseError> {
-        let size = size.max(1).min(16);
+        let size = size.clamp(1, 16);
+        let results: Vec<Result<DaemonParser, ParseError>> = thread::scope(|s| {
+            let handles: Vec<_> = (0..size)
+                .map(|_| s.spawn(|| DaemonParser::start_with_retry(jar_path, java_cmd, 3)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(ParseError::InvokeError(
+                            "daemon spawn thread panicked".into(),
+                        ))
+                    })
+                })
+                .collect()
+        });
+
         let mut daemons = Vec::with_capacity(size);
-        for _ in 0..size {
-            daemons.push(DaemonParser::start(jar_path, java_cmd)?);
+        let mut failures = 0usize;
+        for r in results {
+            match r {
+                Ok(d) => daemons.push(Mutex::new(d)),
+                Err(_) => failures += 1,
+            }
         }
+
+        if daemons.is_empty() {
+            return Err(ParseError::InvokeError(format!(
+                "all {size} daemon JVM(s) failed to start"
+            )));
+        }
+        if failures > 0 {
+            eprintln!(
+                "PERF-WARN: daemon pool degraded: {}/{} JVM(s) started; parse throughput reduced proportionally",
+                daemons.len(),
+                size
+            );
+        }
+
         Ok(DaemonPool {
             jar_path: jar_path.to_path_buf(),
             java_cmd: java_cmd.to_string(),
-            daemons: Mutex::new(daemons),
+            daemons,
             next: AtomicUsize::new(0),
         })
     }
 
     /// 轮询选取一个 daemon 执行解析；若实例已死则重启并重试一次。
-    pub fn parse(
-        &self,
-        source: &str,
-        filename: &str,
-    ) -> Result<CompilationUnit, ParseError> {
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.len();
-        let mut daemons = self
-            .daemons
+    ///
+    /// 仅持有该 daemon 自身的锁，其余实例在 IPC 往返期间不受阻塞。
+    pub fn parse(&self, source: &str, filename: &str) -> Result<CompilationUnit, ParseError> {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.daemons.len();
+        let mut daemon = self.daemons[idx]
             .lock()
-            .map_err(|_| ParseError::ParserError("daemon pool lock poisoned".to_string()))?;
+            .map_err(|_| ParseError::ParserError(format!("daemon {idx} lock poisoned")))?;
 
-        let result = daemons[idx].parse(source, filename);
-        match result {
+        match daemon.parse(source, filename) {
             // 管道 / 进程级错误 → daemon 很可能已死，重启后重试一次
             Err(ParseError::IoError(_)) | Err(ParseError::InvokeError(_)) => {
-                eprintln!("warn: parser daemon {} died, restarting...", idx);
-                match DaemonParser::start(&self.jar_path, &self.java_cmd) {
+                eprintln!("warn: parser daemon {idx} died, restarting...");
+                match DaemonParser::start_with_retry(&self.jar_path, &self.java_cmd, 2) {
                     Ok(parser) => {
-                        daemons[idx] = parser; // 旧实例在赋值时被 Drop（kill + wait）
-                        daemons[idx].parse(source, filename)
+                        *daemon = parser; // 旧实例在赋值时被 Drop（kill + wait）
+                        daemon.parse(source, filename)
                     }
                     Err(e) => Err(e),
                 }
@@ -269,16 +341,65 @@ impl DaemonPool {
     }
 
     pub fn len(&self) -> usize {
-        self.daemons
-            .lock()
-            .map(|d| d.len())
-            .unwrap_or(1)
+        self.daemons.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.daemons.is_empty()
     }
 }
 
 impl JavaParser for DaemonPool {
     fn parse(&self, source: &str, filename: &str) -> Result<CompilationUnit, ParseError> {
         self.parse(source, filename)
+    }
+}
+
+/// 惰性解析器：**首次真实解析（缓存 miss）时才启动 JVM 池**。
+///
+/// AST 缓存 100% 命中的增量扫描一个 JVM 都不会拉起；
+/// 池启动失败时自动回退到 per-file JVM（CliParser），并输出显眼的性能告警。
+/// 线程安全：多个 worker 同时触发首次解析时，仅一个执行启动，其余等待复用。
+pub struct LazyParser {
+    jar_path: PathBuf,
+    java_cmd: String,
+    pool_size: usize,
+    inner: OnceLock<Arc<dyn JavaParser>>,
+}
+
+impl LazyParser {
+    pub fn new(jar_path: &Path, java_cmd: &str, pool_size: usize) -> Self {
+        LazyParser {
+            jar_path: jar_path.to_path_buf(),
+            java_cmd: java_cmd.to_string(),
+            pool_size,
+            inner: OnceLock::new(),
+        }
+    }
+
+    fn get(&self) -> &Arc<dyn JavaParser> {
+        self.inner.get_or_init(|| {
+            match DaemonPool::start(&self.jar_path, &self.java_cmd, self.pool_size) {
+                Ok(pool) => {
+                    eprintln!("Parser: daemon pool ({} resident JVM(s))", pool.len());
+                    Arc::new(pool)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "PERF-WARN: daemon pool unavailable ({e}); \
+                         falling back to per-file JVM mode — expect ~300ms+ JVM startup \
+                         per file, large projects will be 10x+ slower"
+                    );
+                    Arc::new(CliParser::new(&self.jar_path).with_java_cmd(self.java_cmd.clone()))
+                }
+            }
+        })
+    }
+}
+
+impl JavaParser for LazyParser {
+    fn parse(&self, source: &str, filename: &str) -> Result<CompilationUnit, ParseError> {
+        self.get().parse(source, filename)
     }
 }
 
@@ -316,14 +437,19 @@ mod tests {
             .unwrap()
             .join("java-parser/target/java-parser.jar");
         if !jar.exists() {
-            eprintln!("skipping: {} not found (run mvn package first)", jar.display());
+            eprintln!(
+                "skipping: {} not found (run mvn package first)",
+                jar.display()
+            );
             return;
         }
         let java_cmd = std::env::var("JAVA_CMD").unwrap_or_else(|_| "java".to_string());
         let parser = DaemonParser::start(&jar, &java_cmd).expect("daemon should start");
 
         let source = "class Test { void run() { System.out.println(1); } }";
-        let unit = parser.parse(source, "Test.java").expect("parse should succeed");
+        let unit = parser
+            .parse(source, "Test.java")
+            .expect("parse should succeed");
         assert_eq!(unit.types.len(), 1);
         assert_eq!(unit.source_file, "Test.java");
         assert!(!unit.raw_json.is_empty());
@@ -331,7 +457,9 @@ mod tests {
         let err = parser.parse("class {", "Bad.java").unwrap_err();
         assert!(matches!(err, ParseError::ParserError(_)));
         // 出错后 daemon 仍可继续解析
-        let unit2 = parser.parse("class Ok {}", "Ok.java").expect("parse should succeed");
+        let unit2 = parser
+            .parse("class Ok {}", "Ok.java")
+            .expect("parse should succeed");
         assert_eq!(unit2.types.len(), 1);
     }
 
@@ -343,7 +471,10 @@ mod tests {
             .unwrap()
             .join("java-parser/target/java-parser.jar");
         if !jar.exists() {
-            eprintln!("skipping: {} not found (run mvn package first)", jar.display());
+            eprintln!(
+                "skipping: {} not found (run mvn package first)",
+                jar.display()
+            );
             return;
         }
         let java_cmd = std::env::var("JAVA_CMD").unwrap_or_else(|_| "java".to_string());
@@ -351,10 +482,46 @@ mod tests {
         assert_eq!(pool.len(), 2);
 
         for i in 0..6 {
-            let unit = pool.parse(&format!("class C{i} {{}}"), &format!("C{i}.java"))
+            let unit = pool
+                .parse(&format!("class C{i} {{}}"), &format!("C{i}.java"))
                 .unwrap_or_else(|e| panic!("pool parse {i} failed: {e}"));
             assert_eq!(type_name(&unit.types[0]), format!("C{i}"));
         }
+    }
+
+    /// 惰性解析器：构造时不启动 JVM；解析时启动失败自动回退 CLI（返回 Err 而非 panic）。
+    #[test]
+    fn lazy_parser_defers_and_falls_back() {
+        let lazy = LazyParser::new(
+            Path::new("/no/such/java-parser.jar"),
+            "/nonexistent/java",
+            2,
+        );
+        // 解析会触发：池启动失败（重试后）→ 回退 CLI → CLI 也失败 → Err
+        assert!(lazy.parse("class A {}", "A.java").is_err());
+    }
+
+    /// 空池边界：size=0 时按 1 个实例处理，parse 正常工作（无 jar 跳过）。
+    #[test]
+    fn daemon_pool_size_zero_clamped() {
+        let jar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("java-parser/target/java-parser.jar");
+        if !jar.exists() {
+            eprintln!(
+                "skipping: {} not found (run mvn package first)",
+                jar.display()
+            );
+            return;
+        }
+        let java_cmd = std::env::var("JAVA_CMD").unwrap_or_else(|_| "java".to_string());
+        let pool = DaemonPool::start(&jar, &java_cmd, 0).expect("pool should start");
+        assert_eq!(pool.len(), 1);
+        let unit = pool
+            .parse("class Z {}", "Z.java")
+            .expect("parse should succeed");
+        assert_eq!(type_name(&unit.types[0]), "Z");
     }
 
     fn type_name(t: &crate::ast::TypeDecl) -> &str {

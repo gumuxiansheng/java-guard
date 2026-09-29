@@ -5,11 +5,12 @@
 //! - 每个线程只初始化一次 `Engine`（含深度/运算上限配置）
 //! - 每条规则脚本在每个线程只编译一次
 //! - 每个文件只做一次 AST JSON → Rhai `Dynamic` 转换，规则间共享
+//!
 //! 三者叠加后单个文件的规则阶段开销从数毫秒降到亚毫秒级。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use guard_core::rule::{RuleId, Severity, Violation};
 use java_ast::ast::CompilationUnit;
@@ -137,11 +138,11 @@ thread_local! {
     static THREAD_ENGINE: RefCell<RhaiRuleEngine> = RefCell::new(RhaiRuleEngine::new());
     /// 线程级脚本编译缓存：规则 id → (脚本原文, 编译后的 AST)。
     /// 缓存键同时保存脚本原文并在命中时校验，保证同一 id 换脚本后自动失效。
-    static COMPILED_SCRIPTS: RefCell<HashMap<String, (String, Arc<rhai::AST>)>> =
+    static COMPILED_SCRIPTS: RefCell<HashMap<String, (String, Rc<rhai::AST>)>> =
         RefCell::new(HashMap::new());
     /// 线程级 AST 转换缓存：存最近一次 (raw_json → Rhai Dynamic)，按原文精确匹配复用。
     /// 单 slot 即可——同一线程同一时刻只处理一个文件。
-    static AST_CONVERSION: RefCell<Option<(String, Dynamic)>> = RefCell::new(None);
+    static AST_CONVERSION: RefCell<Option<(String, Dynamic)>> = const { RefCell::new(None) };
 }
 
 /// 读取 AST 的原始 JSON（`raw_json` 为空时构建回退 JSON）。
@@ -226,7 +227,7 @@ pub fn run_cached(
                 let ast = match scripts.get(&rule.id) {
                     Some((src, ast)) if src == &rule.script => ast.clone(),
                     _ => {
-                        let ast = Arc::new(
+                        let ast = Rc::new(
                             engine
                                 .engine
                                 .compile(&rule.script)

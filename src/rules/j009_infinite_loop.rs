@@ -492,19 +492,25 @@ enum LoopRef<'a> {
 }
 
 fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &ConstCtx) {
-    let (cond, body, line, is_for, update, init): (Option<&Expr>, &Stmt, usize, bool, &[Expr], &Option<Expr>) =
-        match loop_ref {
-            LoopRef::For(f) => (
-                f.condition.as_ref(),
-                &f.body,
-                f.line,
-                true,
-                &f.update,
-                &f.initialization,
-            ),
-            LoopRef::While(w) => (Some(&w.condition), &w.body, w.line, false, &[], &None),
-            LoopRef::Do(d) => (Some(&d.condition), &d.body, d.line, false, &[], &None),
-        };
+    let (cond, body, line, is_for, update, init): (
+        Option<&Expr>,
+        &Stmt,
+        usize,
+        bool,
+        &[Expr],
+        &Option<Expr>,
+    ) = match loop_ref {
+        LoopRef::For(f) => (
+            f.condition.as_ref(),
+            &f.body,
+            f.line,
+            true,
+            &f.update,
+            &f.initialization,
+        ),
+        LoopRef::While(w) => (Some(&w.condition), &w.body, w.line, false, &[], &None),
+        LoopRef::Do(d) => (Some(&d.condition), &d.body, d.line, false, &[], &None),
+    };
 
     let init_vars = extract_init_vars(init);
     let init_ints = extract_init_ints(init);
@@ -593,7 +599,8 @@ fn check_loop(file: &str, out: &mut Vec<Violation>, loop_ref: LoopRef, ctx: &Con
     // 2c) #1c：for update 方向与条件矛盾（i < N 但 i-- / i > 0 但 i++）
     if is_for && !update.is_empty() {
         if let Some(cond_expr) = cond {
-            if let Some(violation) = check_update_direction_conflict(cond_expr, update, &init_ints) {
+            if let Some(violation) = check_update_direction_conflict(cond_expr, update, &init_ints)
+            {
                 push_loop_violation(out, file, line, end_line, violation);
                 return;
             }
@@ -682,8 +689,10 @@ fn eval_expr_bool(e: &Expr, ctx: &ConstCtx, init_ints: &HashMap<String, i64>) ->
             }
             _ => {
                 // 先尝试整型比较（如 `i < 10`）
-                if let (Some(l), Some(r)) = (eval_int(&be.left, init_ints), eval_int(&be.right, init_ints))
-                {
+                if let (Some(l), Some(r)) = (
+                    eval_int(&be.left, init_ints),
+                    eval_int(&be.right, init_ints),
+                ) {
                     Some(compare_op(be.op.as_str(), l, r))
                 } else {
                     match be.op.as_str() {
@@ -1223,8 +1232,8 @@ fn check_update_direction_conflict(
             }
 
             let moving_away = match (op, delta) {
-                ("<" | "<=", d) if d < 0 => true,   // 条件需要 i 增加，但 i 在减小
-                (">" | ">=", d) if d > 0 => true,   // 条件需要 i 减小，但 i 在增大
+                ("<" | "<=", d) if d < 0 => true, // 条件需要 i 增加，但 i 在减小
+                (">" | ">=", d) if d > 0 => true, // 条件需要 i 减小，但 i 在增大
                 _ => false,
             };
 
@@ -1348,11 +1357,13 @@ fn loop_has_exit_stmt(stmt: &Stmt, rel: usize, in_lambda: bool) -> bool {
             loop_has_exit_stmt(&f.body, rel + 1, in_lambda)
                 || f.condition
                     .as_ref()
-                    .map_or(false, |c| loop_has_exit_expr(c, rel + 1, in_lambda))
+                    .is_some_and(|c| loop_has_exit_expr(c, rel + 1, in_lambda))
                 || f.initialization
                     .as_ref()
-                    .map_or(false, |c| loop_has_exit_expr(c, rel + 1, in_lambda))
-                || f.update.iter().any(|u| loop_has_exit_expr(u, rel + 1, in_lambda))
+                    .is_some_and(|c| loop_has_exit_expr(c, rel + 1, in_lambda))
+                || f.update
+                    .iter()
+                    .any(|u| loop_has_exit_expr(u, rel + 1, in_lambda))
         }
         Stmt::ForEachStmt(fe) => {
             // for-each 自身是循环：体内的 break 只退出 for-each（rel+1）；
@@ -1374,35 +1385,41 @@ fn loop_has_exit_stmt(stmt: &Stmt, rel: usize, in_lambda: bool) -> bool {
             .any(|s| loop_has_exit_stmt(s, rel, in_lambda)),
         Stmt::IfStmt(is) => {
             loop_has_exit_stmt(&is.then_stmt, rel, in_lambda)
-                || is.else_stmt
+                || is
+                    .else_stmt
                     .as_ref()
-                    .map_or(false, |e| loop_has_exit_stmt(e, rel, in_lambda))
+                    .is_some_and(|e| loop_has_exit_stmt(e, rel, in_lambda))
                 || loop_has_exit_expr(&is.condition, rel, in_lambda)
         }
         Stmt::TryStmt(ts) => {
             loop_has_exit_block(&ts.try_body, rel, in_lambda)
-                || ts.catch_clauses
+                || ts
+                    .catch_clauses
                     .iter()
                     .any(|cc| loop_has_exit_block(&cc.body, rel, in_lambda))
-                || ts.finally_body
+                || ts
+                    .finally_body
                     .as_ref()
-                    .map_or(false, |f| loop_has_exit_block(f, rel, in_lambda))
+                    .is_some_and(|f| loop_has_exit_block(f, rel, in_lambda))
         }
         Stmt::SwitchStmt(ss) => {
             loop_has_exit_expr(&ss.selector, rel, in_lambda)
-                || ss.cases
-                    .iter()
-                    .any(|c| c.statements.iter().any(|s| loop_has_exit_stmt(s, rel, in_lambda)))
+                || ss.cases.iter().any(|c| {
+                    c.statements
+                        .iter()
+                        .any(|s| loop_has_exit_stmt(s, rel, in_lambda))
+                })
         }
         Stmt::SynchronizedStmt(sy) => {
             loop_has_exit_expr(&sy.expr, rel, in_lambda)
                 || loop_has_exit_block(&sy.body, rel, in_lambda)
         }
         Stmt::ExpressionStmt(es) => loop_has_exit_expr(&es.expr, rel, in_lambda),
-        Stmt::VariableDeclarationStmt(vs) => vs
-            .declarations
-            .iter()
-            .any(|d| d.initializer.as_ref().map_or(false, |i| loop_has_exit_expr(i, rel, in_lambda))),
+        Stmt::VariableDeclarationStmt(vs) => vs.declarations.iter().any(|d| {
+            d.initializer
+                .as_ref()
+                .is_some_and(|i| loop_has_exit_expr(i, rel, in_lambda))
+        }),
         Stmt::ContinueStmt(_) => false,
         _ => false,
     }
@@ -1414,16 +1431,23 @@ fn loop_has_exit_block(b: &BlockStmt, rel: usize, in_lambda: bool) -> bool {
         .any(|s| loop_has_exit_stmt(s, rel, in_lambda))
 }
 
+// rel 仅为出口嵌套深度占位（与 loop_has_exit_stmt 的计数语义对齐），本层 match 不直接消费。
+#[allow(clippy::only_used_in_recursion)]
 fn loop_has_exit_expr(expr: &Expr, rel: usize, in_lambda: bool) -> bool {
     match expr {
-        Expr::MethodCallExpr(mc) => mc.arguments.iter().any(|a| loop_has_exit_expr(a, rel, in_lambda)),
+        Expr::MethodCallExpr(mc) => mc
+            .arguments
+            .iter()
+            .any(|a| loop_has_exit_expr(a, rel, in_lambda)),
         Expr::FieldAccessExpr(fa) => loop_has_exit_expr(&fa.target, rel, in_lambda),
         Expr::BinaryExpr(be) => {
-            loop_has_exit_expr(&be.left, rel, in_lambda) || loop_has_exit_expr(&be.right, rel, in_lambda)
+            loop_has_exit_expr(&be.left, rel, in_lambda)
+                || loop_has_exit_expr(&be.right, rel, in_lambda)
         }
         Expr::UnaryExpr(ue) => loop_has_exit_expr(&ue.expr, rel, in_lambda),
         Expr::AssignExpr(ae) => {
-            loop_has_exit_expr(&ae.target, rel, in_lambda) || loop_has_exit_expr(&ae.value, rel, in_lambda)
+            loop_has_exit_expr(&ae.target, rel, in_lambda)
+                || loop_has_exit_expr(&ae.value, rel, in_lambda)
         }
         Expr::CastExpr(ce) => loop_has_exit_expr(&ce.expr, rel, in_lambda),
         Expr::ConditionalExpr(ce) => {
@@ -1432,20 +1456,24 @@ fn loop_has_exit_expr(expr: &Expr, rel: usize, in_lambda: bool) -> bool {
                 || loop_has_exit_expr(&ce.else_expr, rel, in_lambda)
         }
         Expr::ArrayAccessExpr(aa) => {
-            loop_has_exit_expr(&aa.array, rel, in_lambda) || loop_has_exit_expr(&aa.index, rel, in_lambda)
+            loop_has_exit_expr(&aa.array, rel, in_lambda)
+                || loop_has_exit_expr(&aa.index, rel, in_lambda)
         }
-        Expr::ArrayCreationExpr(ac) => {
-            ac.initializer.iter().any(|i| loop_has_exit_expr(i, rel, in_lambda))
-        }
-        Expr::ObjectCreationExpr(oc) => {
-            oc.arguments.iter().any(|a| loop_has_exit_expr(a, rel, in_lambda))
-        }
+        Expr::ArrayCreationExpr(ac) => ac
+            .initializer
+            .iter()
+            .any(|i| loop_has_exit_expr(i, rel, in_lambda)),
+        Expr::ObjectCreationExpr(oc) => oc
+            .arguments
+            .iter()
+            .any(|a| loop_has_exit_expr(a, rel, in_lambda)),
         Expr::InstanceOfExpr(io) => loop_has_exit_expr(&io.expr, rel, in_lambda),
         Expr::LambdaExpr(le) => loop_has_exit_stmt(&le.body, rel, true),
-        Expr::VariableDeclarationExpr(vde) => vde
-            .declarations
-            .iter()
-            .any(|d| d.initializer.as_ref().map_or(false, |i| loop_has_exit_expr(i, rel, in_lambda))),
+        Expr::VariableDeclarationExpr(vde) => vde.declarations.iter().any(|d| {
+            d.initializer
+                .as_ref()
+                .is_some_and(|i| loop_has_exit_expr(i, rel, in_lambda))
+        }),
         Expr::EnclosedExpr { inner, .. } => loop_has_exit_expr(inner, rel, in_lambda),
         Expr::NameExpr(_)
         | Expr::LiteralExpr(_)
@@ -1737,7 +1765,10 @@ mod tests {
 
     #[test]
     fn ignores_while_true_with_break() {
-        let body = body_with(vec![Stmt::BreakStmt(BreakStmt { label: None, line: 2 })]);
+        let body = body_with(vec![Stmt::BreakStmt(BreakStmt {
+            label: None,
+            line: 2,
+        })]);
         let unit = unit_with(vec![while_true(body)]);
         let vs = InfiniteLoopRule::new().check_unit(&unit);
         assert_eq!(vs.len(), 0, "while(true) 含 break 不会死循环");
@@ -1756,7 +1787,10 @@ mod tests {
     fn ignores_conditional_break() {
         let body = body_with(vec![Stmt::IfStmt(IfStmt {
             condition: name("x"),
-            then_stmt: Box::new(Stmt::BreakStmt(BreakStmt { label: None, line: 3 })),
+            then_stmt: Box::new(Stmt::BreakStmt(BreakStmt {
+                label: None,
+                line: 3,
+            })),
             else_stmt: None,
             line: 2,
         })]);
@@ -1783,7 +1817,10 @@ mod tests {
     fn lambda_return_does_not_mask_outer_loop() {
         let lambda = Expr::LambdaExpr(LambdaExpr {
             parameters: vec![],
-            body: Box::new(body_with(vec![Stmt::ReturnStmt(ReturnStmt { expr: None, line: 2 })])),
+            body: Box::new(body_with(vec![Stmt::ReturnStmt(ReturnStmt {
+                expr: None,
+                line: 2,
+            })])),
             line: 2,
         });
         let es = Stmt::ExpressionStmt(ExprStmt {
@@ -1957,7 +1994,10 @@ mod tests {
                 name("running"),
                 body_with(vec![Stmt::IfStmt(IfStmt {
                     condition: name("x"),
-                    then_stmt: Box::new(Stmt::BreakStmt(BreakStmt { label: None, line: 3 })),
+                    then_stmt: Box::new(Stmt::BreakStmt(BreakStmt {
+                        label: None,
+                        line: 3,
+                    })),
                     else_stmt: None,
                     line: 2,
                 })]),
@@ -1998,7 +2038,11 @@ mod tests {
         );
         let unit = unit_with(vec![f]);
         let vs = InfiniteLoopRule::new().check_unit(&unit);
-        assert_eq!(vs.len(), 0, "i = 0 与初始值 10 不同，循环可正常终止，不应报 #1b");
+        assert_eq!(
+            vs.len(),
+            0,
+            "i = 0 与初始值 10 不同，循环可正常终止，不应报 #1b"
+        );
     }
 
     #[test]
@@ -2051,7 +2095,11 @@ mod tests {
         );
         let unit = unit_with(vec![f]);
         let vs = InfiniteLoopRule::new().check_unit(&unit);
-        assert_eq!(vs.len(), 0, "条件变量 n 在循环体内被修改，循环可能终止，不应报 #1");
+        assert_eq!(
+            vs.len(),
+            0,
+            "条件变量 n 在循环体内被修改，循环可能终止，不应报 #1"
+        );
     }
 
     // ---- #1c 回归：无关变量的 update 不应中断方向矛盾检测 ----
@@ -2105,19 +2153,39 @@ mod tests {
     #[test]
     fn for_each_break_does_not_exit_outer_loop() {
         // while (true) { for (String s : list) { break; } } —— break 只退出 for-each
-        let fe = for_each_stmt(name("list"), Stmt::BreakStmt(BreakStmt { label: None, line: 3 }));
+        let fe = for_each_stmt(
+            name("list"),
+            Stmt::BreakStmt(BreakStmt {
+                label: None,
+                line: 3,
+            }),
+        );
         let unit = unit_with(vec![while_true(body_with(vec![fe]))]);
         let vs = InfiniteLoopRule::new().check_unit(&unit);
-        assert_eq!(vs.len(), 1, "for-each 内的 break 不退出外层 while(true)，外层仍应报死循环");
+        assert_eq!(
+            vs.len(),
+            1,
+            "for-each 内的 break 不退出外层 while(true)，外层仍应报死循环"
+        );
     }
 
     #[test]
     fn for_each_return_exits_outer_loop() {
         // while (true) { for (String s : list) { return; } } —— return 退出整个方法
-        let fe = for_each_stmt(name("list"), Stmt::ReturnStmt(ReturnStmt { expr: None, line: 3 }));
+        let fe = for_each_stmt(
+            name("list"),
+            Stmt::ReturnStmt(ReturnStmt {
+                expr: None,
+                line: 3,
+            }),
+        );
         let unit = unit_with(vec![while_true(body_with(vec![fe]))]);
         let vs = InfiniteLoopRule::new().check_unit(&unit);
-        assert_eq!(vs.len(), 0, "for-each 内的 return 会退出外层 while(true)，不应报死循环");
+        assert_eq!(
+            vs.len(),
+            0,
+            "for-each 内的 return 会退出外层 while(true)，不应报死循环"
+        );
     }
 
     #[test]

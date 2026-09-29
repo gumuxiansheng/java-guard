@@ -57,7 +57,7 @@ impl AstCache {
         }
         let version_file = self.dir.join("parser.version");
         match std::fs::read_to_string(&version_file) {
-            Ok(existing) if existing == self.parser_version => return,
+            Ok(existing) if existing == self.parser_version => {}
             _ => {
                 let _ = std::fs::remove_dir_all(&self.dir);
                 let _ = std::fs::create_dir_all(&self.dir);

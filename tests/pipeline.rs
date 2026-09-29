@@ -134,27 +134,27 @@ fn pipeline_reports_violations_on_fixtures() {
 
     // J001 禁止 System.out.println：三个 fixture 均命中
     assert!(
-        rule_ids.iter().any(|r| *r == "J001"),
+        rule_ids.contains(&"J001"),
         "expected J001 violations, got: {rule_ids:?}"
     );
     // J008 空 catch 块：RuleViolations.java / BadCode.java 命中
     assert!(
-        rule_ids.iter().any(|r| *r == "J008"),
+        rule_ids.contains(&"J008"),
         "expected J008 (empty catch) violations, got: {rule_ids:?}"
     );
     // J003 禁止通配符 import：RuleViolations.java 的 `import java.util.*`
     assert!(
-        rule_ids.iter().any(|r| *r == "J003"),
+        rule_ids.contains(&"J003"),
         "expected J003 (wildcard import) violations, got: {rule_ids:?}"
     );
     // J016 catch 中静默抛错（未先记录日志）：RuleViolations.java 的 silentRethrow 命中
     assert!(
-        rule_ids.iter().any(|r| *r == "J016"),
+        rule_ids.contains(&"J016"),
         "expected J016 (rethrow without logging) violations, got: {rule_ids:?}"
     );
     // J017 禁止直接使用日志实现：RuleViolations.java 的 org.apache.log4j.Logger 命中
     assert!(
-        rule_ids.iter().any(|r| *r == "J017"),
+        rule_ids.contains(&"J017"),
         "expected J017 (direct log impl import) violations, got: {rule_ids:?}"
     );
 
@@ -311,7 +311,7 @@ fn pipeline_enable_overrides_disabled_flag() {
         .map(|v| v["rule_id"].as_str().unwrap_or(""))
         .collect();
     assert!(
-        ids_en.iter().any(|r| *r == "J104"),
+        ids_en.contains(&"J104"),
         "J104 must fire when explicitly --enable'd (enabled=false in toml)\nids: {ids_en:?}\n{stdout_enabled}"
     );
 
@@ -342,7 +342,7 @@ fn pipeline_enable_overrides_disabled_flag() {
         .map(|v| v["rule_id"].as_str().unwrap_or(""))
         .collect();
     assert!(
-        !ids_de.iter().any(|r| *r == "J104"),
+        !ids_de.contains(&"J104"),
         "J104 must NOT fire by default (enabled=false)\nids: {ids_de:?}\n{stdout_default}"
     );
 }
