@@ -21,6 +21,46 @@ rules_file = "javaguard.rules.toml"
 # 最低严重级别：info / minor / major / critical
 # min_severity = "info"
 
+# ── 规则包（多包加载 / 合并 / 覆盖）───────────────────────────────────────────
+# 规则与引擎分开发版：官方默认包、业务线/项目组自建包各自独立版本化，
+# 项目通过本节选包、覆盖参数，无需复制规则脚本。
+# 合并优先级（低 → 高）：packs（按声明顺序，靠后覆盖靠前）< 本文件 rules_file
+# 指向的项目本地规则 < overrides。
+#
+# 包就是一个目录：
+#   <pack-root>/rules-pack.toml   ← 包清单（[pack] 元数据 + [[rules]]）
+#   <pack-root>/rules/*.yml|*.rhai
+#
+# 包清单示例：
+#   [pack]
+#   name        = "team-a-rules"      # 必填，须与下方引用的 name 一致
+#   namespace   = "team-a"            # 可选，规则对外 id 变为 team-a:J001
+#   version     = "1.2.0"             # 必填
+#   api_version = 1                   # 必填，高于引擎支持版本时拒绝加载
+#   engine      = ">=0.1 <1"          # 可选，兼容的引擎版本范围
+#
+# [rule_packs]
+# # 包搜索路径：按 <search_path>/<name>/rules-pack.toml 查找（相对本文件目录）
+# search_paths = ["vendor/rules", "../shared-rules"]
+# # 生效的包；也可用 { name = "x", path = "./my-rules" } 直接指向包根
+# packs = [{ name = "team-a-rules" }]
+#
+# # 项目级覆盖：只改 enabled / severity / params，不复制脚本（最高优先级）
+# [[rule_packs.overrides]]
+# id = "team-a:J701"          # 规范 id 或裸 id（J701）均可
+# enabled = false
+# severity = "major"
+#
+# ── 规则包锁文件 javaguard.lock ───────────────────────────────────────────────
+# 记录每个生效包的 name/version/source/checksum，保证「同配置 → 同规则集 → 同结果」。
+# 提交到版本库，CI 用 `scan --locked` 强制校验。
+#
+#   java-guard rules lock      # 按当前解析结果生成 / 更新 javaguard.lock
+#   java-guard rules verify    # 校验锁与当前规则包一致（比对 name + version）
+#   java-guard rules verify --locked  # 严格：额外比对 checksum，并要求锁完整
+#   java-guard scan . --locked # 扫描前严格校验（锁缺失/版本不符/checksum 不符均报错）
+#   java-guard scan . --no-lock      # 临时跳过锁校验（不推荐用于 CI）
+
 # ── 扫描配置 ──────────────────────────────────────────────────────────────────
 
 [scan]

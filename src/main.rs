@@ -1,4 +1,6 @@
 mod adapters;
+mod rulelock;
+mod rulepack;
 mod rules;
 mod scanner;
 
@@ -152,11 +154,35 @@ enum Command {
         /// 输出各阶段耗时分解到 stderr（性能定位用：rules-load/traverse/diff/check/report）
         #[clap(long)]
         timings: bool,
+
+        /// 严格按 javaguard.lock 校验规则包：锁缺失、版本不符、checksum 不符均报错（CI 推荐）
+        #[clap(long, conflicts_with = "no_lock")]
+        locked: bool,
+
+        /// 跳过 javaguard.lock 校验（临时绕过；不推荐用于 CI）
+        #[clap(long)]
+        no_lock: bool,
     },
-    /// 列出所有可用规则（内置 + YAML + Rhai）
-    Rules,
+    /// 列出规则，或管理规则包锁文件（lock / verify）
+    Rules {
+        #[clap(subcommand)]
+        action: Option<RulesAction>,
+    },
     /// 显示版本信息和构建详情
     Version,
+}
+
+/// `java-guard rules` 的子命令；不指定时列出规则。
+#[derive(clap::Subcommand)]
+enum RulesAction {
+    /// 按当前解析结果生成 / 更新 javaguard.lock
+    Lock,
+    /// 校验 javaguard.lock 与当前规则包是否一致（不执行检查）
+    Verify {
+        /// 严格模式：额外比对 checksum，并要求锁文件存在且不含多余条目
+        #[clap(long)]
+        locked: bool,
+    },
 }
 
 fn main() {
@@ -186,6 +212,8 @@ fn main() {
             encoding,
             no_cache,
             timings,
+            locked,
+            no_lock,
         } => {
             if let Err(e) = run_scan(
                 &path,
@@ -210,63 +238,151 @@ fn main() {
                 encoding.as_str(),
                 no_cache,
                 timings,
+                locked,
+                no_lock,
             ) {
                 eprintln!("Error: {e}");
                 std::process::exit(2);
             }
         }
-        Command::Rules => {
-            // 优先从 java-guard.toml 的 rules_file 加载规则列表
-            let project_config = load_project_config("java-guard.toml").unwrap_or_default();
-            let rules_file_path = project_config
-                .rules
-                .rules_file
-                .as_deref()
-                .unwrap_or("javaguard.rules.toml");
-            match load_rules_file(rules_file_path) {
-                Ok(entries) if !entries.is_empty() => {
-                    println!("Rules (from {}):", rules_file_path);
-                    println!(
-                        "{:<8} {:<30} {:<10} {:<8} Description",
-                        "ID", "Name", "Group", "Severity"
-                    );
-                    println!("{}", "-".repeat(90));
-                    for entry in &entries {
-                        let group = entry.group.as_deref().unwrap_or("-");
-                        let desc = entry.description.as_deref().unwrap_or("");
-                        let enabled_mark = if entry.enabled { "" } else { " [disabled]" };
-                        println!(
-                            "{:<8} {:<30} {:<10} {:<8} {}{}",
-                            entry.id, entry.name, group, entry.severity, desc, enabled_mark
-                        );
-                    }
-                }
-                _ => {
-                    // 回退：扫描 rules/ 目录
-                    println!("Rules (from rules/ directory):");
-                    println!("Built-in rules:");
-                    for r in rules::builtin_rules() {
-                        println!("  {} [{}] {}", r.id(), r.severity(), r.description());
-                    }
-                    let yaml_rules = load_yaml_rules(Path::new("rules"));
-                    for r in &yaml_rules {
-                        println!("  {} [{}] {} (YAML)", r.id, r.severity, r.title);
-                    }
-                    let rhai_dir = Path::new("rules").join("rhai");
-                    if rhai_dir.is_dir() {
-                        if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
-                            for r in &rhai_rules {
-                                println!("  {} [{}] {} (Rhai)", r.id, r.severity, r.title);
-                            }
-                        }
-                    }
-                }
+        Command::Rules { action } => {
+            let result = match action {
+                None => rules_list(),
+                Some(RulesAction::Lock) => rules_lock(),
+                Some(RulesAction::Verify { locked }) => rules_verify(locked),
+            };
+            if let Err(e) = result {
+                eprintln!("Error: {e}");
+                std::process::exit(2);
             }
         }
         Command::Version => {
             println!("java-guard {}", env!("CARGO_PKG_VERSION"));
         }
     }
+}
+
+/// 加载 java-guard.toml 并解析规则包，返回 `(合并结果, 配置文件目录)`。
+///
+/// `rules` 子命令与 `scan` 共用同一条解析链路（规则包 + 本地规则 + overrides）。
+fn load_merged_rules() -> anyhow::Result<(rulepack::MergedRules, PathBuf)> {
+    let project_config = load_project_config("java-guard.toml")?;
+    let config_dir = Path::new("java-guard.toml")
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let rules_file_path = project_config
+        .rules
+        .rules_file
+        .as_deref()
+        .unwrap_or("javaguard.rules.toml");
+    let merged = rulepack::resolve_and_merge(
+        &project_config.rule_packs,
+        Path::new(rules_file_path),
+        &config_dir,
+    )?;
+    Ok((merged, config_dir))
+}
+
+/// `java-guard rules`：列出生效规则（规则包 + 本地规则合并后的结果）。
+fn rules_list() -> anyhow::Result<()> {
+    let (merged, _config_dir) = load_merged_rules()?;
+    for w in &merged.warnings {
+        eprintln!("warn: failed to load rules file: {w}");
+    }
+    for n in &merged.notes {
+        eprintln!("note: {n}");
+    }
+    if merged.rules.is_empty() {
+        // 回退：扫描 rules/ 目录（兼容未使用规则文件的旧项目）
+        println!("Rules (from rules/ directory):");
+        println!("Built-in rules:");
+        for r in rules::builtin_rules() {
+            println!("  {} [{}] {}", r.id(), r.severity(), r.description());
+        }
+        let yaml_rules = load_yaml_rules(Path::new("rules"));
+        for r in &yaml_rules {
+            println!("  {} [{}] {} (YAML)", r.id, r.severity, r.title);
+        }
+        let rhai_dir = Path::new("rules").join("rhai");
+        if rhai_dir.is_dir() {
+            if let Ok(rhai_rules) = load_rhai_rules(&rhai_dir) {
+                for r in &rhai_rules {
+                    println!("  {} [{}] {} (Rhai)", r.id, r.severity, r.title);
+                }
+            }
+        }
+        return Ok(());
+    }
+    if !merged.packs.is_empty() {
+        println!("Rule packs:");
+        for p in &merged.packs {
+            let ns = p.namespace.as_deref().unwrap_or("-");
+            println!(
+                "  {}@{} (api_version={}, namespace={}, {} rules) — {}",
+                p.name,
+                p.version,
+                p.api_version,
+                ns,
+                p.rule_count,
+                p.root.display()
+            );
+        }
+    }
+    println!("Rules:");
+    println!(
+        "{:<20} {:<30} {:<10} {:<8} Description",
+        "ID", "Name", "Group", "Severity"
+    );
+    println!("{}", "-".repeat(100));
+    for entry in &merged.rules {
+        let group = entry.group.as_deref().unwrap_or("-");
+        let desc = entry.description.as_deref().unwrap_or("");
+        let enabled_mark = if entry.enabled { "" } else { " [disabled]" };
+        println!(
+            "{:<20} {:<30} {:<10} {:<8} {}{}",
+            entry.id, entry.name, group, entry.severity, desc, enabled_mark
+        );
+    }
+    Ok(())
+}
+
+/// `java-guard rules lock`：按当前解析结果生成 / 更新 javaguard.lock。
+fn rules_lock() -> anyhow::Result<()> {
+    let (merged, config_dir) = load_merged_rules()?;
+    if merged.packs.is_empty() {
+        println!("No rule packs configured; nothing to lock.");
+        return Ok(());
+    }
+    let lock = rulelock::build_lock(&merged.packs, &config_dir)?;
+    let path = rulelock::write_lock(&lock, &config_dir)?;
+    println!("Wrote {}", path.display());
+    for p in &lock.packs {
+        println!("  {:<24} {:<10} {}", p.name, p.version, p.source);
+    }
+    Ok(())
+}
+
+/// `java-guard rules verify`：校验锁文件与当前规则包是否一致。
+fn rules_verify(locked: bool) -> anyhow::Result<()> {
+    let (merged, config_dir) = load_merged_rules()?;
+    let mode = if locked {
+        rulelock::LockMode::Strict
+    } else {
+        rulelock::LockMode::Auto
+    };
+    for note in rulelock::verify_lock(&merged.packs, &config_dir, mode)? {
+        println!("note: {note}");
+    }
+    for note in &merged.notes {
+        println!("note: {note}");
+    }
+    println!(
+        "OK: {} rule pack(s), {} rule(s) effective",
+        merged.packs.len(),
+        merged.rules.len()
+    );
+    Ok(())
 }
 
 /// 查找回退用的 rules/ 目录：exe 同级（部署布局 A）→ exe 上级（deploy/bin 布局 B）→ cwd（源码布局 C）。
@@ -630,6 +746,8 @@ fn run_scan(
     encoding: &str,
     no_cache: bool,
     timings: bool,
+    locked: bool,
+    no_lock: bool,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
 
@@ -753,23 +871,56 @@ fn run_scan(
         );
     }
 
-    // 优先从 TOML 规则文件加载
-    let loaded_from_toml = match load_rules_file(resolved_rules_file.to_str().unwrap_or("")) {
-        Ok(entries) if !entries.is_empty() => {
-            let config_dir_for_rules = resolved_rules_file.parent().unwrap_or(Path::new("."));
-            for entry in &entries {
-                if let Some(r) = load_rule_from_entry(entry, config_dir_for_rules, &builtin) {
-                    rule_list.push(r);
-                }
-            }
-            true
-        }
-        Ok(_) => false,
-        Err(e) => {
-            eprintln!("warn: failed to load rules file: {e}");
-            false
-        }
+    // 优先从 TOML 规则文件 + `[rule_packs]` 规则包加载（合并优先级：
+    // 包层 < 项目本地规则 < [[rule_packs.overrides]]）。
+    // 包层错误（找不到包 / 清单非法 / 版本契约不满足）为硬错误，直接失败；
+    // 本地规则文件出错只告警，走下方回退分支。
+    let merged = match rulepack::resolve_and_merge(
+        &project_config.rule_packs,
+        &resolved_rules_file,
+        config_dir,
+    ) {
+        Ok(m) => m,
+        Err(e) => return Err(anyhow::anyhow!("{e}")),
     };
+    for w in &merged.warnings {
+        eprintln!("warn: failed to load rules file: {w}");
+    }
+    for n in &merged.notes {
+        eprintln!("note: {n}");
+    }
+    if !merged.packs.is_empty() {
+        let summary: Vec<String> = merged
+            .packs
+            .iter()
+            .map(|p| format!("{}@{}({} rules)", p.name, p.version, p.rule_count))
+            .collect();
+        eprintln!("note: rule packs: {}", summary.join(", "));
+    }
+
+    // 锁文件校验（保证「同配置 → 同规则集 → 同结果」，CI 可复现）。
+    // 默认 Auto：只比对 name/version；--locked 升为 Strict（额外比对 checksum）；
+    // --no-lock 跳过。包层校验失败为硬错误。
+    let lock_mode = if no_lock {
+        rulelock::LockMode::Off
+    } else if locked {
+        rulelock::LockMode::Strict
+    } else {
+        rulelock::LockMode::Auto
+    };
+    for note in rulelock::verify_lock(&merged.packs, config_dir, lock_mode)? {
+        eprintln!("note: {note}");
+    }
+
+    let config_dir_for_rules = resolved_rules_file.parent().unwrap_or(Path::new("."));
+    let loaded_from_toml = !merged.rules.is_empty();
+    if loaded_from_toml {
+        for entry in &merged.rules {
+            if let Some(r) = load_rule_from_entry(entry, config_dir_for_rules, &builtin) {
+                rule_list.push(r);
+            }
+        }
+    }
 
     // 回退：目录扫描（向后兼容旧版 rules/ 目录结构）
     // 注意：不能依赖 env!("CARGO_MANIFEST_DIR")（编译期源码路径，发布后用户机器上不存在），
@@ -799,11 +950,16 @@ fn run_scan(
     // 2) enable 覆盖优先级最高——非空时仅保留列出的规则，无视 enabled 字段
     //    （否则 enabled=false 的规则即便被 --enable 选中，仍会在 run_rules 的 enabled() 闸门被跳过）；
     // 3) 未指定 enable 时，默认仅保留 enabled=true 的规则。
+    // id 匹配：规范 id（`ns:J001`）精确匹配，或裸 id（`J001`）跨包聚合匹配。
     if !disable_ids.is_empty() {
-        rule_list.retain(|r| !disable_ids.iter().any(|d| r.id().0 == *d));
+        rule_list.retain(|r| {
+            !disable_ids
+                .iter()
+                .any(|d| rulepack::id_matches(d, &r.id().0))
+        });
     }
     if !enable_ids.is_empty() {
-        rule_list.retain(|r| enable_ids.iter().any(|e| r.id().0 == *e));
+        rule_list.retain(|r| enable_ids.iter().any(|e| rulepack::id_matches(e, &r.id().0)));
     } else {
         rule_list.retain(|r| r.enabled());
     }
@@ -1339,6 +1495,8 @@ fn find_parser_jar(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
 struct ProjectConfig {
     /// 规则配置
     rules: RulesConfig,
+    /// 规则包配置（`[rule_packs]`，多包加载 / 合并 / 覆盖）
+    rule_packs: rulepack::RulePacksConfig,
     /// 扫描配置
     scan: ScanConfig,
     /// gate 配置
@@ -1416,8 +1574,15 @@ fn default_true() -> bool {
 }
 
 /// 规则文件的完整结构（javaguard.rules.toml）。
+///
+/// 一个规则文件即一个**规则包**（Rule Pack）：可选的 `[pack]` 段声明包元数据
+/// （name / version / api_version / engine 兼容范围），`[[rules]]` 为包内规则列表。
+/// 不写 `[pack]` 段时按「无声明」处理，行为与引入包概念前完全一致（向后兼容）。
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RulesFile {
+    /// 包元数据（可选）。声明后引擎会做 API 版本与引擎版本范围的硬校验。
+    #[serde(default)]
+    pub pack: Option<guard_core::RulePackMeta>,
     /// 规则列表
     pub rules: Vec<RuleEntry>,
 }
@@ -1437,18 +1602,27 @@ fn load_project_config(path: &str) -> anyhow::Result<ProjectConfig> {
     Ok(cfg)
 }
 
-/// 加载规则文件（javaguard.rules.toml）。
+/// 加载规则文件的原始结构（javaguard.rules.toml）。
 ///
-/// 文件不存在时返回空列表（不报错）。
-fn load_rules_file(path: &str) -> anyhow::Result<Vec<RuleEntry>> {
+/// 文件不存在时返回 `None`（不报错）。返回的 `[pack]` 段已通过版本契约校验。
+fn load_rules_file_raw(path: &str) -> anyhow::Result<Option<RulesFile>> {
     let p = Path::new(path);
     if !p.exists() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let content =
         std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("read rules file {path}: {e}"))?;
     let file: RulesFile =
         toml::from_str(&content).map_err(|e| anyhow::anyhow!("parse rules file {path}: {e}"))?;
+    // 规则包版本契约校验（硬错误）：防止「新规则跑在旧引擎上静默失效」。
+    // 未声明 [pack] 的旧规则文件跳过校验，完全向后兼容。
+    if let Some(pack) = &file.pack {
+        pack.validate()
+            .map_err(|e| anyhow::anyhow!("rules file {path}: {e}"))?;
+        if let Some(e) = pack.engine_compat_error(env!("CARGO_PKG_VERSION")) {
+            return Err(anyhow::anyhow!("rules file {path}: {e}"));
+        }
+    }
     // 校验 rule ID 唯一性
     let mut seen = std::collections::HashSet::new();
     for rule in &file.rules {
@@ -1456,7 +1630,15 @@ fn load_rules_file(path: &str) -> anyhow::Result<Vec<RuleEntry>> {
             return Err(anyhow::anyhow!("duplicate rule ID: {}", rule.id));
         }
     }
-    Ok(file.rules)
+    Ok(Some(file))
+}
+
+/// 加载规则文件（javaguard.rules.toml），返回规则列表。仅供测试使用。
+///
+/// 文件不存在时返回空列表（不报错）。
+#[cfg(test)]
+fn load_rules_file(path: &str) -> anyhow::Result<Vec<RuleEntry>> {
+    Ok(load_rules_file_raw(path)?.map(|f| f.rules).unwrap_or_default())
 }
 
 /// 根据 RuleEntry 加载实际的规则执行器。
@@ -1664,12 +1846,45 @@ mod tests {
     fn cli_parse_rules_and_version() {
         assert!(matches!(
             Cli::parse_from(vec!["java-guard", "rules"]).command,
-            Command::Rules
+            Command::Rules { action: None }
+        ));
+        assert!(matches!(
+            Cli::parse_from(vec!["java-guard", "rules", "lock"]).command,
+            Command::Rules {
+                action: Some(RulesAction::Lock)
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(vec!["java-guard", "rules", "verify"]).command,
+            Command::Rules {
+                action: Some(RulesAction::Verify { locked: false })
+            }
+        ));
+        assert!(matches!(
+            Cli::parse_from(vec!["java-guard", "rules", "verify", "--locked"]).command,
+            Command::Rules {
+                action: Some(RulesAction::Verify { locked: true })
+            }
         ));
         assert!(matches!(
             Cli::parse_from(vec!["java-guard", "version"]).command,
             Command::Version
         ));
+    }
+
+    #[test]
+    fn cli_scan_lock_flags_parse() {
+        let cli = Cli::parse_from(vec!["java-guard", "scan", ".", "--locked"]);
+        let Command::Scan { locked, no_lock, .. } = cli.command else {
+            panic!("expected scan");
+        };
+        assert!(locked && !no_lock);
+
+        let cli = Cli::parse_from(vec!["java-guard", "scan", ".", "--no-lock"]);
+        let Command::Scan { locked, no_lock, .. } = cli.command else {
+            panic!("expected scan");
+        };
+        assert!(!locked && no_lock);
     }
 
     #[test]
@@ -1762,6 +1977,115 @@ script_path = "x.yml"
 id = "J001"
 name = "b"
 script_path = "y.yml"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        assert!(load_rules_file(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_without_pack_is_backward_compatible() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test_no_pack");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[[rules]]
+id = "J001"
+name = "a"
+script_path = "x.yml"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        let entries = load_rules_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_with_compatible_pack_passes() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test_pack_ok");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[pack]
+name = "test-pack"
+version = "1.0.0"
+api_version = 1
+engine = ">=0.1 <1"
+
+[[rules]]
+id = "J001"
+name = "a"
+script_path = "x.yml"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        let entries = load_rules_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_with_future_api_version_errors() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test_pack_api");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[pack]
+name = "future-pack"
+version = "2.0.0"
+api_version = 999
+
+[[rules]]
+id = "J001"
+name = "a"
+script_path = "x.yml"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        let err = load_rules_file(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("future-pack"), "msg: {msg}");
+        assert!(msg.contains("rule API version"), "msg: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_with_incompatible_engine_errors() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test_pack_engine");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[pack]
+name = "engine-mismatch"
+version = "1.0.0"
+api_version = 1
+engine = ">=99.0"
+
+[[rules]]
+id = "J001"
+name = "a"
+script_path = "x.yml"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+        let err = load_rules_file(path.to_str().unwrap()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("engine-mismatch"), "msg: {msg}");
+        assert!(msg.contains("engine version"), "msg: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_rules_file_with_invalid_engine_range_errors() {
+        let dir = std::env::temp_dir().join("javaguard_rules_test_pack_bad_range");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("javaguard.rules.toml");
+        let toml_content = r#"
+[pack]
+name = "bad-range"
+engine = ">=abc"
+
+[[rules]]
+id = "J001"
+name = "a"
+script_path = "x.yml"
 "#;
         std::fs::write(&path, toml_content).unwrap();
         assert!(load_rules_file(path.to_str().unwrap()).is_err());
