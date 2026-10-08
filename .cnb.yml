@@ -31,6 +31,17 @@ $:
             # 产物无 glibc 依赖，可在任意 Linux 发行版（含 Alpine）直接运行
             - cargo build --release --target x86_64-unknown-linux-musl
             - cp ./target-release/x86_64-unknown-linux-musl/release/java-guard ./dist/java-guard-linux-amd64
+        # 规则包独立交付物：通用包与各团队定制包分开发布（版本取自各包 rules-pack.toml），
+        # 与引擎版本解耦；新增团队包时在 for 列表登记一行即可
+        - name: pack rule packs
+          script:
+            - mkdir -p ./dist/rules-packs
+            - |
+              for pack in rules-core rules-dep-security rules-spring; do
+                ver=$(grep -m1 -E '^version[[:space:]]*=' "config/$pack/rules-pack.toml" | cut -d'"' -f2)
+                tar -czf "./dist/rules-packs/$pack-$ver.tar.gz" -C config "$pack"
+                echo "packed config/$pack -> $pack-$ver.tar.gz"
+              done
         - name: upload java-parser.jar
           image: cnbcool/attachments:latest
           settings:
@@ -41,6 +52,11 @@ $:
           settings:
             attachments:
               - "./dist/java-guard-linux-amd64"
+        - name: upload rule packs
+          image: cnbcool/attachments:latest
+          settings:
+            attachments:
+              - "./dist/rules-packs/*.tar.gz"
 
     # ── Pipeline 2: 构建 Linux aarch64 ──
     - name: release-linux-arm64

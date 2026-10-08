@@ -86,6 +86,8 @@ pub struct ResolvedPack {
 pub struct MergedRules {
     /// 合并后的规则条目（包内脚本路径已解析为绝对路径）。
     pub rules: Vec<RuleEntry>,
+    /// 每条规则的来源（与 `rules` 一一对应）：`pack '<name>'` 或 `project rules`。
+    pub sources: Vec<String>,
     /// 生效的规则包（按声明顺序）。
     pub packs: Vec<ResolvedPack>,
     /// 非致命提示（如 id 被后层覆盖）。
@@ -222,6 +224,7 @@ pub fn resolve_and_merge(
     apply_overrides(&mut layer.rules, &cfg.overrides)?;
 
     merged.rules = layer.rules;
+    merged.sources = layer.sources;
     Ok(merged)
 }
 
@@ -261,9 +264,12 @@ pub fn id_matches(pattern: &str, canonical_id: &str) -> bool {
 }
 
 /// 按优先级分层合并：同 canonical id 时**后者覆盖前者**（原地替换，保持声明顺序）。
+///
+/// `sources` 与 `rules` 平行，记录每条规则的来源标签（供 `rules` 列表展示）。
 #[derive(Default)]
 struct Layered {
     rules: Vec<RuleEntry>,
+    sources: Vec<String>,
 }
 
 impl Layered {
@@ -275,8 +281,12 @@ impl Layered {
                     rule.id
                 ));
                 self.rules[pos] = rule;
+                self.sources[pos] = source.to_string();
             }
-            None => self.rules.push(rule),
+            None => {
+                self.rules.push(rule);
+                self.sources.push(source.to_string());
+            }
         }
     }
 }

@@ -183,6 +183,24 @@ enum RulesAction {
         #[clap(long)]
         locked: bool,
     },
+    /// 注册一个本地规则包到 java-guard.toml 的 [rule_packs].packs
+    ///
+    /// 先完整走一遍解析链路校验（清单 / 版本契约 / 脚本逃逸），通过后写入配置
+    /// 并自动刷新 javaguard.lock。
+    Add {
+        /// 包名（须与包清单 [pack].name 一致）
+        name: String,
+        /// 包根目录（含 rules-pack.toml；相对 java-guard.toml 所在目录解析）
+        #[clap(long)]
+        path: String,
+        /// 要求的版本（可选；写入后与包清单 [pack].version 强一致校验）
+        #[clap(long)]
+        version: Option<String>,
+    },
+    /// 把当前生效的规则包复制到 <config>/vendor/rules/（入库存档，供离线复现）
+    ///
+    /// 并确保 java-guard.toml 的 [rule_packs].search_paths 首位包含 "vendor/rules"。
+    Vendor,
 }
 
 fn main() {
@@ -250,6 +268,10 @@ fn main() {
                 None => rules_list(),
                 Some(RulesAction::Lock) => rules_lock(),
                 Some(RulesAction::Verify { locked }) => rules_verify(locked),
+                Some(RulesAction::Add { name, path, version }) => {
+                    rules_add(&name, &path, version.as_deref())
+                }
+                Some(RulesAction::Vendor) => rules_vendor(),
             };
             if let Err(e) = result {
                 eprintln!("Error: {e}");
@@ -331,17 +353,31 @@ fn rules_list() -> anyhow::Result<()> {
     }
     println!("Rules:");
     println!(
-        "{:<20} {:<30} {:<10} {:<8} Description",
-        "ID", "Name", "Group", "Severity"
+        "{:<20} {:<28} {:<10} {:<8} {:<18} Description",
+        "ID", "Name", "Group", "Severity", "Pack"
     );
-    println!("{}", "-".repeat(100));
-    for entry in &merged.rules {
+    println!("{}", "-".repeat(112));
+    for (i, entry) in merged.rules.iter().enumerate() {
         let group = entry.group.as_deref().unwrap_or("-");
         let desc = entry.description.as_deref().unwrap_or("");
         let enabled_mark = if entry.enabled { "" } else { " [disabled]" };
+        // 来源包：`pack 'rules-core'` -> `rules-core`；项目本地规则显示为 `(local)`
+        let pack = merged
+            .sources
+            .get(i)
+            .map(|s| {
+                if s == "project rules" {
+                    "(local)".to_string()
+                } else {
+                    s.trim_start_matches("pack '")
+                        .trim_end_matches('\'')
+                        .to_string()
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<20} {:<30} {:<10} {:<8} {}{}",
-            entry.id, entry.name, group, entry.severity, desc, enabled_mark
+            "{:<20} {:<28} {:<10} {:<8} {:<18} {}{}",
+            entry.id, entry.name, group, entry.severity, pack, desc, enabled_mark
         );
     }
     Ok(())
@@ -383,6 +419,227 @@ fn rules_verify(locked: bool) -> anyhow::Result<()> {
         merged.rules.len()
     );
     Ok(())
+}
+
+/// `java-guard rules add <name> --path <dir> [--version <v>]`：
+/// 校验规则包可加载后，把引用写入 java-guard.toml 的 [rule_packs].packs 并刷新锁文件。
+fn rules_add(name: &str, path: &str, version: Option<&str>) -> anyhow::Result<()> {
+    let config_path = PathBuf::from("java-guard.toml");
+    let project_config = load_project_config("java-guard.toml")?;
+    let config_dir = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let rules_file_path = project_config
+        .rules
+        .rules_file
+        .as_deref()
+        .unwrap_or("javaguard.rules.toml");
+
+    if project_config
+        .rule_packs
+        .packs
+        .iter()
+        .any(|p| p.name == name)
+    {
+        anyhow::bail!(
+            "rule pack '{name}' is already registered in {}; remove the [[rule_packs.packs]] \
+             entry first if you want to re-add it",
+            config_path.display()
+        );
+    }
+
+    // 校验：把新包追加进临时配置后完整走一遍解析链路
+    // （清单合法性 / api_version / engine 版本契约 / 版本一致 / 脚本逃逸全部过闸）。
+    let mut probe = project_config.rule_packs.clone();
+    probe.packs.push(rulepack::PackRef {
+        name: name.to_string(),
+        version: version.map(str::to_string),
+        path: Some(PathBuf::from(path)),
+    });
+    let merged = rulepack::resolve_and_merge(&probe, Path::new(rules_file_path), &config_dir)?;
+    let added = merged
+        .packs
+        .last()
+        .expect("the pack pushed above must resolve");
+
+    append_pack_to_config(&config_path, name, version, path)?;
+    println!(
+        "Added rule pack '{}' v{} ({})",
+        added.name,
+        added.version,
+        added.root.display()
+    );
+    rules_lock()?;
+    println!("hint: its rules default to the pack's own enabled state; turn them on per project via [[rule_packs.overrides]], e.g.");
+    println!("  [[rule_packs.overrides]]");
+    println!("  id = \"<rule-id>\"");
+    println!("  enabled = true");
+    Ok(())
+}
+
+/// `java-guard rules vendor`：把当前生效的规则包复制到 <config>/vendor/rules/<name>/
+/// 并确保 [rule_packs].search_paths 首位包含 "vendor/rules"（离线 / 入库复现）。
+fn rules_vendor() -> anyhow::Result<()> {
+    let (merged, config_dir) = load_merged_rules()?;
+    if merged.packs.is_empty() {
+        println!("No rule packs configured; nothing to vendor.");
+        return Ok(());
+    }
+    let vendored = config_dir.join("vendor").join("rules");
+    std::fs::create_dir_all(&vendored)?;
+    for p in &merged.packs {
+        let dst = vendored.join(&p.name);
+        copy_dir_recursive(&p.root, &dst).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to vendor pack '{}' -> '{}': {e}",
+                p.name,
+                dst.display()
+            )
+        })?;
+        println!(
+            "vendored {:<22} v{:<8} -> {}",
+            p.name,
+            p.version,
+            dst.display()
+        );
+    }
+    ensure_search_path_first(&PathBuf::from("java-guard.toml"), "vendor/rules")?;
+    println!(
+        "note: \"vendor/rules\" is now first in [rule_packs].search_paths of java-guard.toml; \
+         packs registered with an explicit `path` keep resolving there — drop the `path` line \
+         to resolve from vendor/rules instead."
+    );
+    Ok(())
+}
+
+/// 递归复制目录（vendor 用；目标已存在时覆盖同名文件）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// 把一条 `[[rule_packs.packs]]` 引用文本化追加到配置文件末尾（保留用户原有格式）。
+///
+/// 配置文件不存在时创建最小骨架。路径统一写正斜杠（TOML 字符串免转义，Windows 亦识别）。
+fn append_pack_to_config(
+    config_path: &Path,
+    name: &str,
+    version: Option<&str>,
+    path: &str,
+) -> anyhow::Result<()> {
+    let mut content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::from("# java-guard.toml（由 `java-guard rules add` 生成）\n")
+    };
+    if config_registers_pack(&content, name) {
+        anyhow::bail!(
+            "{} already registers rule pack '{name}'",
+            config_path.display()
+        );
+    }
+    content.push_str("\n[[rule_packs.packs]]\n");
+    content.push_str(&format!("name = \"{name}\"\n"));
+    if let Some(v) = version {
+        content.push_str(&format!("version = \"{v}\"\n"));
+    }
+    content.push_str(&format!("path = \"{}\"\n", path.replace('\\', "/")));
+    std::fs::write(config_path, content)?;
+    Ok(())
+}
+
+/// 行级检测：配置文本的 `[[rule_packs.packs]]` 段里是否已注册同名包。
+fn config_registers_pack(content: &str, name: &str) -> bool {
+    let want = format!("name = \"{name}\"");
+    let mut in_packs_table = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("[[") {
+            in_packs_table = t == "[[rule_packs.packs]]";
+        } else if t.starts_with('[') {
+            in_packs_table = false;
+        } else if in_packs_table && (t == want || t.replace('\'', "\"") == want) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 确保 java-guard.toml 的 `[rule_packs].search_paths` 数组首位是给定路径
+/// （已存在则移到首位；无该键则在 `[rule_packs]` 段内插入；无段则追加段）。
+fn ensure_search_path_first(config_path: &Path, want: &str) -> anyhow::Result<()> {
+    let mut lines: Vec<String> = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+            .lines()
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let quoted = format!("\"{want}\"");
+    match lines.iter().position(|l| l.trim() == "[rule_packs]") {
+        Some(h) => {
+            // 段范围到下一个表头（顶层表或数组表均终止）
+            let end = lines[h + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .map(|i| i + h + 1)
+                .unwrap_or(lines.len());
+            match (h..end).find(|&i| lines[i].trim_start().starts_with("search_paths")) {
+                Some(i) => lines[i] = insert_search_path_first(&lines[i], want),
+                None => lines.insert(h + 1, format!("search_paths = [{quoted}]")),
+            }
+        }
+        None => {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.push("[rule_packs]".into());
+            lines.push(format!("search_paths = [{quoted}]"));
+        }
+    }
+    // 末行换行 + 防重复换行
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(config_path, out)?;
+    Ok(())
+}
+
+/// 把单行 `search_paths = [...]` 数组变换为以 `want` 为首位的等价行。
+fn insert_search_path_first(line: &str, want: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let eq = line.find('=').expect("search_paths line must contain '='");
+    let arr = line[eq + 1..].trim();
+    let inner = arr.trim_start_matches('[').trim_end_matches(']').trim();
+    let mut items: Vec<String> = if inner.is_empty() {
+        Vec::new()
+    } else {
+        inner
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let quoted = format!("\"{want}\"");
+    items.retain(|s| *s != quoted);
+    items.insert(0, quoted);
+    format!("{indent}search_paths = [{}]", items.join(", "))
 }
 
 /// 查找回退用的 rules/ 目录：exe 同级（部署布局 A）→ exe 上级（deploy/bin 布局 B）→ cwd（源码布局 C）。
@@ -2509,5 +2766,337 @@ message: "x"
         assert!(load_rule_from_entry(&rule_entry("IMPCTX", "import_ctx.yml"), &dir, &[]).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== 规则包分层守护测试（防漂移）=====
+    //
+    // 「通用 / 定制」分层后，规则内容存在两份载体：
+    //   1. javaguard.rules.toml（单文件旧布局镜像，默认消费路径）；
+    //   2. config/rules-*/rules-pack.toml（可独立发布与版本化的规则包）。
+    // 以下测试保证两者逐条一致：任何一侧改动而另一侧未同步时，CI 直接失败。
+
+    /// config/ 下的三个默认规则包：`(目录名, 期望 namespace)`。
+    const DEFAULT_PACKS: [(&str, Option<&str>); 3] = [
+        ("rules-core", None),
+        ("rules-dep-security", Some("dep")),
+        ("rules-spring", Some("spring")),
+    ];
+
+    fn load_repo_rules_example() -> RulesFile {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("javaguard.rules.toml");
+        load_rules_file_raw(path.to_str().unwrap())
+            .expect("javaguard.rules.toml must load")
+            .expect("javaguard.rules.toml must exist")
+    }
+
+    fn load_repo_pack(dir_name: &str) -> (PathBuf, RulesFile) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config").join(dir_name);
+        let manifest_path = root.join(rulepack::PACK_MANIFEST_FILE);
+        let content = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+        let file: RulesFile = toml::from_str(&content)
+            .unwrap_or_else(|e| panic!("parse {}: {e}", manifest_path.display()));
+        (root, file)
+    }
+
+    #[test]
+    fn pack_manifests_match_rules_example() {
+        let example = load_repo_rules_example();
+        let example_by_id: std::collections::HashMap<&str, &RuleEntry> =
+            example.rules.iter().map(|r| (r.id.as_str(), r)).collect();
+
+        let mut pack_rules: Vec<(String, RuleEntry)> = Vec::new();
+        for (dir_name, expect_ns) in DEFAULT_PACKS {
+            let (root, file) = load_repo_pack(dir_name);
+
+            // [pack] 元数据：name 与目录一致、版本契约声明完整、namespace 符合分层约定
+            let meta = file.pack.as_ref().unwrap_or_else(|| {
+                panic!("pack '{dir_name}': manifest must declare a [pack] section")
+            });
+            meta.validate().unwrap_or_else(|e| panic!("pack '{dir_name}': {e}"));
+            assert_eq!(meta.name.as_deref(), Some(dir_name), "pack dir/name mismatch");
+            assert!(meta.version.is_some(), "pack '{dir_name}' must declare version");
+            assert_eq!(meta.namespace.as_deref(), expect_ns, "pack '{dir_name}' namespace");
+
+            for rule in &file.rules {
+                // 定制包默认全关：启用走 [[rule_packs.overrides]]，包内不得默认 enabled
+                if expect_ns.is_some() {
+                    assert!(
+                        !rule.enabled,
+                        "pack '{dir_name}' rule {} must default to enabled = false",
+                        rule.id
+                    );
+                }
+                pack_rules.push((dir_name.to_string(), rule.clone()));
+            }
+        }
+
+        // 覆盖完备性：三包并集 == example（不重不漏）
+        let pack_short_ids: Vec<String> =
+            pack_rules.iter().map(|(_, r)| r.id.clone()).collect();
+        let mut sorted = pack_short_ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            pack_short_ids.len(),
+            "duplicate short id across default packs: {pack_short_ids:?}"
+        );
+        let mut example_ids: Vec<&str> = example_by_id.keys().copied().collect();
+        example_ids.sort();
+        assert_eq!(sorted, example_ids, "default packs union must equal javaguard.rules.toml");
+
+        // 逐条比对：name / group / description / severity / enabled（core 包）/
+        // 脚本内容（example 侧与包侧字节一致，防两份载体内容漂移）
+        for (pack_name, rule) in &pack_rules {
+            let ex = example_by_id
+                .get(rule.id.as_str())
+                .unwrap_or_else(|| panic!("rule {} missing in example", rule.id));
+            assert_eq!(rule.name, ex.name, "rule {} name drift", rule.id);
+            assert_eq!(rule.group, ex.group, "rule {} group drift", rule.id);
+            assert_eq!(rule.description, ex.description, "rule {} description drift", rule.id);
+            assert_eq!(rule.severity, ex.severity, "rule {} severity drift", rule.id);
+            if *pack_name == "rules-core" {
+                assert_eq!(rule.enabled, ex.enabled, "rule {} enabled drift", rule.id);
+            }
+
+            if rule.script_path.starts_with("builtin:") {
+                assert_eq!(rule.script_path, ex.script_path, "rule {} builtin drift", rule.id);
+                continue;
+            }
+            let pack_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config").join(pack_name);
+            let pack_script = pack_root.join(&rule.script_path);
+            let example_script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&ex.script_path);
+            let pack_bytes = std::fs::read(&pack_script)
+                .unwrap_or_else(|e| panic!("read {}: {e}", pack_script.display()));
+            let example_bytes = std::fs::read(&example_script)
+                .unwrap_or_else(|e| panic!("read {}: {e}", example_script.display()));
+            assert_eq!(
+                pack_bytes, example_bytes,
+                "rule {} script content drift between pack '{}' and example",
+                rule.id, pack_name
+            );
+            // 脚本不得逃逸包根（与 rulepack::resolve_pack_script 同策略）
+            let canon_root = pack_root.canonicalize().unwrap();
+            let canon = pack_script.canonicalize().unwrap();
+            assert!(
+                canon.starts_with(&canon_root),
+                "rule {} script escapes pack root '{}'",
+                rule.id,
+                pack_name
+            );
+        }
+
+        // example 引用的所有脚本都存在（路径迁移后不留悬空引用）
+        for rule in &example.rules {
+            if rule.script_path.starts_with("builtin:") {
+                continue;
+            }
+            let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&rule.script_path);
+            assert!(p.is_file(), "example rule {} script missing: {}", rule.id, p.display());
+        }
+    }
+
+    /// 三个默认包可直接经 `[rule_packs]` 加载：合并后的生效 id 与 example 一致
+    /// （core 裸 id；dep/spring 规则为 `<ns>:<id>`），且 api/engine 契约对本引擎成立。
+    #[test]
+    fn default_packs_load_and_merge_to_example_set() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cfg = rulepack::RulePacksConfig {
+            search_paths: vec![root.join("config").to_string_lossy().into_owned()],
+            packs: DEFAULT_PACKS
+                .iter()
+                .map(|(name, _)| rulepack::PackRef {
+                    name: (*name).to_string(),
+                    version: None,
+                    path: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        // 本地规则文件指向不存在的路径：合并结果应完全来自包层
+        let merged = rulepack::resolve_and_merge(
+            &cfg,
+            &root.join("__no_local_rules__.toml"),
+            &root,
+        )
+        .expect("default packs must resolve and merge");
+
+        assert_eq!(merged.packs.len(), 3);
+        let example = load_repo_rules_example();
+        assert_eq!(merged.rules.len(), example.rules.len());
+
+        // 包合并顺序 = packs 声明顺序，与 example 条目顺序不同，按短 id 映射比对
+        let merged_by_short: std::collections::HashMap<String, &RuleEntry> = merged
+            .rules
+            .iter()
+            .map(|r| (rulepack::short_id(&r.id).to_string(), r))
+            .collect();
+        assert_eq!(
+            merged_by_short.len(),
+            example.rules.len(),
+            "short id must stay unique after namespace qualification"
+        );
+        for example_rule in &example.rules {
+            let m = merged_by_short.get(example_rule.id.as_str()).unwrap_or_else(|| {
+                panic!("rule {} missing in merged default packs", example_rule.id)
+            });
+            assert_eq!(m.severity, example_rule.severity);
+            // enabled 仅对通用包（裸 id）要求与 example 一致；
+            // 定制包（dep:*/spring:*）默认全关，属分层设计而非漂移
+            if !m.id.contains(':') {
+                assert_eq!(m.enabled, example_rule.enabled, "rule {} enabled drift", m.id);
+            } else {
+                assert!(!m.enabled, "namespaced rule {} must default to disabled", m.id);
+            }
+            // 包内脚本路径已解析为绝对路径且存在
+            assert!(
+                m.script_path.starts_with("builtin:")
+                    || Path::new(&m.script_path).is_absolute(),
+                "pack rule script must resolve to an absolute path: {}",
+                m.script_path
+            );
+        }
+        // sources 与规则一一对应：core 包规则带包名标签，本地缺失文件不产生来源
+        assert_eq!(merged.sources.len(), merged.rules.len());
+        for (r, s) in merged.rules.iter().zip(&merged.sources) {
+            if r.id.contains(':') {
+                assert!(
+                    s == "pack 'rules-dep-security'" || s == "pack 'rules-spring'",
+                    "namespaced rule {} sourced from unexpected '{s}'",
+                    r.id
+                );
+            } else {
+                assert_eq!(s, "pack 'rules-core'", "bare id {} unexpected source", r.id);
+            }
+        }
+    }
+
+    // ── M3: rules add / vendor 的文本编辑 helpers ─────────────────────────────
+
+    fn temp_cfg_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("javaguard_maincfg_{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn append_pack_to_config_creates_file_and_appends_entry() {
+        let dir = temp_cfg_dir("append_create");
+        let cfg = dir.join("java-guard.toml");
+
+        append_pack_to_config(&cfg, "rules-spring", Some("1.0.0"), "../team/rules-spring")
+            .expect("append into missing config must create it");
+
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("[[rule_packs.packs]]"));
+        assert!(text.contains("name = \"rules-spring\""));
+        assert!(text.contains("version = \"1.0.0\""));
+        // Windows 反斜杠统一写成正斜杠
+        assert!(!text.contains('\\'), "path must use forward slashes: {text}");
+        // 必须仍是合法 TOML 且字段可解析
+        let value: toml::Value = toml::from_str(&text).expect("generated config must parse");
+        assert_eq!(
+            value["rule_packs"]["packs"][0]["path"].as_str(),
+            Some("../team/rules-spring")
+        );
+    }
+
+    #[test]
+    fn append_pack_to_config_rejects_duplicate_and_keeps_existing_content() {
+        let dir = temp_cfg_dir("append_dup");
+        let cfg = dir.join("java-guard.toml");
+        std::fs::write(
+            &cfg,
+            "[scan]\nexclude = [\"target\"]\n\n[[rule_packs.packs]]\nname = \"rules-core\"\n",
+        )
+        .unwrap();
+
+        // 同名重复 → 报错
+        assert!(append_pack_to_config(&cfg, "rules-core", None, "config/rules-core").is_err());
+
+        // 不同名 → 追加且原内容保持在前
+        append_pack_to_config(&cfg, "rules-spring", None, "config/rules-spring").unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("[scan]"));
+        assert!(text.contains("exclude = [\"target\"]"));
+        assert!(
+            text.find("name = \"rules-core\"").unwrap()
+                < text.find("name = \"rules-spring\"").unwrap()
+        );
+        let value: toml::Value = toml::from_str(&text).expect("appended config must parse");
+        assert_eq!(value["rule_packs"]["packs"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ensure_search_path_first_appends_section_when_missing() {
+        let dir = temp_cfg_dir("sp_missing");
+        let cfg = dir.join("java-guard.toml");
+        std::fs::write(&cfg, "[scan]\nmin_severity = \"info\"\n").unwrap();
+
+        ensure_search_path_first(&cfg, "vendor/rules").unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        let value: toml::Value = toml::from_str(&text).expect("result must parse");
+        assert_eq!(
+            value["rule_packs"]["search_paths"][0].as_str(),
+            Some("vendor/rules")
+        );
+        assert_eq!(value["scan"]["min_severity"].as_str(), Some("info"));
+    }
+
+    #[test]
+    fn ensure_search_path_first_inserts_into_existing_section() {
+        let dir = temp_cfg_dir("sp_insert");
+        let cfg = dir.join("java-guard.toml");
+        std::fs::write(
+            &cfg,
+            "[rule_packs]\nallow_remote = false\n\n[[rule_packs.packs]]\nname = \"rules-core\"\n",
+        )
+        .unwrap();
+
+        ensure_search_path_first(&cfg, "vendor/rules").unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        // search_paths 必须落在 [rule_packs] 段内、packs 条目之前
+        let sp = text.find("search_paths").expect("search_paths inserted");
+        let packs = text.find("[[rule_packs.packs]]").unwrap();
+        let header = text.find("[rule_packs]").unwrap();
+        assert!(header < sp && sp < packs, "inserted at wrong place: {text}");
+        let value: toml::Value = toml::from_str(&text).expect("result must parse");
+        assert_eq!(
+            value["rule_packs"]["search_paths"][0].as_str(),
+            Some("vendor/rules")
+        );
+    }
+
+    #[test]
+    fn ensure_search_path_first_moves_existing_entry_to_front() {
+        let dir = temp_cfg_dir("sp_front");
+        let cfg = dir.join("java-guard.toml");
+        std::fs::write(
+            &cfg,
+            "[rule_packs]\nsearch_paths = [\"//nas/shared-packs\", \"vendor/rules\"]\n",
+        )
+        .unwrap();
+
+        ensure_search_path_first(&cfg, "vendor/rules").unwrap();
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("search_paths = [\"vendor/rules\", \"//nas/shared-packs\"]"));
+    }
+
+    #[test]
+    fn insert_search_path_first_handles_empty_and_indented_lines() {
+        assert_eq!(
+            insert_search_path_first("search_paths = []", "vendor/rules"),
+            "search_paths = [\"vendor/rules\"]"
+        );
+        assert_eq!(
+            insert_search_path_first("  search_paths = [\"a\"]", "vendor/rules"),
+            "  search_paths = [\"vendor/rules\", \"a\"]"
+        );
+        assert_eq!(
+            insert_search_path_first("search_paths = [\"vendor/rules\", \"a\"]", "vendor/rules"),
+            "search_paths = [\"vendor/rules\", \"a\"]"
+        );
     }
 }

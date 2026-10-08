@@ -1,9 +1,17 @@
 # =============================================================================
-# java-guard 规则配置
+# java-guard 规则配置（单文件旧布局镜像）
 #
 # 每条 [[rules]] 定义一个规则的元数据和控制参数。
 # 脚本路径（script_path）相对于本文件所在目录解析，也支持绝对路径。
 # 内置 Rust 规则使用 builtin: 前缀（如 builtin:j008_empty_catch）。
+#
+# ★ 规则脚本按「通用 / 定制」分层存放在规则包目录（script_path 指向包内）：
+#     config/rules-core/rules/**           通用规则（无 namespace，裸 id）
+#     config/rules-dep-security/rules/**   依赖与 JSON 选型（namespace = "dep"）
+#     config/rules-spring/rules/**         Spring 与日志规约（namespace = "spring"）
+#   各包有独立清单 config/rules-*/rules-pack.toml，可经 [rule_packs] 独立引用、
+#   独立版本化与发布；本文件与三包清单的并集逐条一致（有守护测试防漂移）。
+#   仅使用本文件（不配 [rule_packs]）时行为与旧版单文件布局完全一致。
 #
 # 在 java-guard.toml 中用 rules_file = "javaguard.rules.toml" 引用本文件；
 # 不写该行时，工具也会自动在同目录查找 javaguard.rules.toml。
@@ -27,7 +35,7 @@ id = "J004"
 name = "class_naming"
 group = "naming"
 description = "类名必须使用 PascalCase（大写驼峰）"
-script_path = "rules/J004_class_naming.yml"
+script_path = "config/rules-core/rules/J004_class_naming.yml"
 severity = "info"
 enabled = true
 
@@ -36,7 +44,7 @@ id = "J005"
 name = "method_naming"
 group = "naming"
 description = "方法名必须使用 camelCase（小写驼峰）"
-script_path = "rules/J005_method_naming.yml"
+script_path = "config/rules-core/rules/J005_method_naming.yml"
 severity = "info"
 enabled = true
 
@@ -45,7 +53,7 @@ id = "J007"
 name = "constant_naming"
 group = "naming"
 description = "常量（static final 字段）必须使用 UPPER_SNAKE_CASE"
-script_path = "rules/J007_constant_naming.yml"
+script_path = "config/rules-core/rules/J007_constant_naming.yml"
 severity = "info"
 enabled = true
 
@@ -56,7 +64,7 @@ id = "J001"
 name = "no_system_out"
 group = "code-style"
 description = "禁止使用 System.out / System.err 直接打印，请使用日志框架（SLF4J）"
-script_path = "rules/J001_no_system_out.yml"
+script_path = "config/rules-core/rules/J001_no_system_out.yml"
 severity = "info"
 enabled = true
 
@@ -65,7 +73,7 @@ id = "J003"
 name = "no_wildcard_import"
 group = "code-style"
 description = "import 不使用通配符（*），应明确导入具体类"
-script_path = "rules/J003_no_wildcard_import.yml"
+script_path = "config/rules-core/rules/J003_no_wildcard_import.yml"
 severity = "info"
 enabled = true
 
@@ -74,7 +82,7 @@ id = "J006"
 name = "long_method"
 group = "code-style"
 description = "单个方法不超过 50 行（可通过 params 自定义阈值）"
-script_path = "rules/rhai/J006_long_method.rhai"
+script_path = "config/rules-core/rules/rhai/J006_long_method.rhai"
 severity = "info"
 enabled = true
 
@@ -88,7 +96,7 @@ id = "J010"
 name = "no_fastjson_import"
 group = "dependency-security"
 description = "禁止 import fastjson / fastjson2，推荐使用 jackson"
-script_path = "rules/J010_no_fastjson.yml"
+script_path = "config/rules-dep-security/rules/J010_no_fastjson.yml"
 severity = "warning"
 enabled = true
 
@@ -97,7 +105,7 @@ id = "J011"
 name = "commons_lang3_stringutils"
 group = "dependency-security"
 description = "StringUtils 应使用 org.apache.commons.lang3.StringUtils，不要自定义或使用其他实现"
-script_path = "rules/rhai/J011_stringutils.rhai"
+script_path = "config/rules-dep-security/rules/rhai/J011_stringutils.rhai"
 severity = "info"
 enabled = true
 
@@ -106,7 +114,7 @@ id = "J012"
 name = "no_fastjson_usage"
 group = "dependency-security"
 description = "代码中禁止直接使用 fastjson / fastjson2 的类（如 JSONObject, JSONArray）"
-script_path = "rules/rhai/J012_fastjson_usage.rhai"
+script_path = "config/rules-dep-security/rules/rhai/J012_fastjson_usage.rhai"
 severity = "warning"
 enabled = true
 
@@ -115,7 +123,7 @@ id = "J014"
 name = "no_nonjackson_json_import"
 group = "dependency-security"
 description = "禁止引入非 jackson 的 JSON 框架（gson, org.json, net.sf.json 等）"
-script_path = "rules/J014_no_nonjackson_json.yml"
+script_path = "config/rules-dep-security/rules/J014_no_nonjackson_json.yml"
 severity = "warning"
 enabled = true
 
@@ -124,7 +132,7 @@ id = "J015"
 name = "no_nonjackson_json_usage"
 group = "dependency-security"
 description = "代码中禁止使用非 jackson JSON 框架的类（如 Gson, JSONObject from org.json）"
-script_path = "rules/rhai/J015_nonjackson_json_usage.rhai"
+script_path = "config/rules-dep-security/rules/rhai/J015_nonjackson_json_usage.rhai"
 severity = "warning"
 enabled = true
 
@@ -155,7 +163,7 @@ id = "J013"
 name = "controller_no_map_param"
 group = "spring-convention"
 description = "Spring Controller HTTP 接口禁止使用 Map 作为方法参数"
-script_path = "rules/rhai/J013_controller_no_map_param.rhai"
+script_path = "config/rules-spring/rules/rhai/J013_controller_no_map_param.rhai"
 severity = "warning"
 enabled = true
 
@@ -173,7 +181,7 @@ id = "J017"
 name = "no_direct_log_impl"
 group = "code-style"
 description = "日志必须使用门面（SLF4J），禁止直接 import 具体日志实现（JUL / Log4j / Logback）"
-script_path = "rules/J017_no_direct_log_impl.yml"
+script_path = "config/rules-spring/rules/J017_no_direct_log_impl.yml"
 severity = "warning"
 enabled = true
 
@@ -201,7 +209,7 @@ id = "J101"
 name = "class_name_no_underscore_dollar"
 group = "naming"
 description = "类名与接口名不得以 _ 或 $ 开头或结尾（规范 4.1【强制】）"
-script_path = "rules/J101_class_name_no_underscore_dollar.yml"
+script_path = "config/rules-core/rules/J101_class_name_no_underscore_dollar.yml"
 severity = "minor"
 enabled = false
 
@@ -210,7 +218,7 @@ id = "J103"
 name = "no_pojo_suffix"
 group = "naming"
 description = "禁止将领域模型类命名为 xxxPOJO，应使用 DO/DTO/BO/VO 具体后缀（规范 4.1【参考】）"
-script_path = "rules/J103_no_pojo_suffix.yml"
+script_path = "config/rules-core/rules/J103_no_pojo_suffix.yml"
 severity = "info"
 enabled = false
 
@@ -219,7 +227,7 @@ id = "J104"
 name = "boolean_no_is_prefix"
 group = "naming"
 description = "POJO 布尔类型字段不得加 is 前缀，避免序列化属性名解析错误（规范 4.1【强制】）"
-script_path = "rules/J104_boolean_no_is_prefix.yml"
+script_path = "config/rules-core/rules/J104_boolean_no_is_prefix.yml"
 severity = "major"
 enabled = false
 
@@ -230,7 +238,7 @@ id = "J201"
 name = "max_line_length"
 group = "format"
 description = "单行字符数不超过 120（规范 4.3【强制】）"
-script_path = "rules/rhai/J201_max_line_length.rhai"
+script_path = "config/rules-core/rules/rhai/J201_max_line_length.rhai"
 severity = "minor"
 enabled = false
 
@@ -242,7 +250,7 @@ id = "J202"
 name = "no_tab_indent"
 group = "format"
 description = "缩进必须使用 4 个空格，禁止 tab 字符（规范 4.3【强制】）"
-script_path = "rules/rhai/J202_no_tab_indent.rhai"
+script_path = "config/rules-core/rules/rhai/J202_no_tab_indent.rhai"
 severity = "minor"
 enabled = false
 
@@ -251,7 +259,7 @@ id = "J203"
 name = "no_trailing_whitespace"
 group = "format"
 description = "行尾不得有多余空白字符（规范 4.3）"
-script_path = "rules/rhai/J203_no_trailing_whitespace.rhai"
+script_path = "config/rules-core/rules/rhai/J203_no_trailing_whitespace.rhai"
 severity = "minor"
 enabled = false
 
@@ -260,7 +268,7 @@ id = "J204"
 name = "unix_line_ending"
 group = "format"
 description = "源文件必须使用 Unix 换行符 LF，不得使用 CRLF（规范 4.3【强制】）"
-script_path = "rules/rhai/J204_unix_line_ending.rhai"
+script_path = "config/rules-core/rules/rhai/J204_unix_line_ending.rhai"
 severity = "minor"
 enabled = false
 
@@ -271,7 +279,7 @@ id = "J301"
 name = "no_bigdecimal_double"
 group = "oop"
 description = "禁止用 new BigDecimal(double) 构造，存在精度损失（规范 4.4【强制】）"
-script_path = "rules/rhai/J301_no_bigdecimal_double.rhai"
+script_path = "config/rules-core/rules/rhai/J301_no_bigdecimal_double.rhai"
 severity = "major"
 enabled = false
 
@@ -280,7 +288,7 @@ id = "J302"
 name = "pojo_no_default_value"
 group = "oop"
 description = "POJO 类属性不得设置默认值（规范 4.4【强制】）"
-script_path = "rules/rhai/J302_pojo_no_default_value.rhai"
+script_path = "config/rules-core/rules/rhai/J302_pojo_no_default_value.rhai"
 severity = "major"
 enabled = false
 
@@ -289,7 +297,7 @@ id = "J303"
 name = "pojo_must_tostring"
 group = "oop"
 description = "POJO 类必须实现 toString（规范 4.4【强制】）"
-script_path = "rules/rhai/J303_pojo_must_tostring.rhai"
+script_path = "config/rules-core/rules/rhai/J303_pojo_must_tostring.rhai"
 severity = "major"
 enabled = false
 
@@ -298,7 +306,7 @@ id = "J304"
 name = "equals_hashcode_pair"
 group = "oop"
 description = "重写 equals 必须同时重写 hashCode（规范 4.5【强制】）"
-script_path = "rules/rhai/J304_equals_hashcode_pair.rhai"
+script_path = "config/rules-core/rules/rhai/J304_equals_hashcode_pair.rhai"
 severity = "major"
 enabled = false
 
@@ -309,7 +317,7 @@ id = "J401"
 name = "no_collection_modify_in_foreach"
 group = "collection"
 description = "for-each 循环内禁止对集合做增删，会触发 ConcurrentModificationException（规范 4.5【强制】）"
-script_path = "rules/J401_no_collection_modify_in_foreach.yml"
+script_path = "config/rules-core/rules/J401_no_collection_modify_in_foreach.yml"
 severity = "major"
 enabled = false
 
@@ -318,7 +326,7 @@ id = "J402"
 name = "toarray_with_typed_array"
 group = "collection"
 description = "集合转数组必须使用 toArray(T[] array)（规范 4.5【强制】）"
-script_path = "rules/rhai/J402_toarray_with_typed_array.rhai"
+script_path = "config/rules-core/rules/rhai/J402_toarray_with_typed_array.rhai"
 severity = "major"
 enabled = false
 
@@ -329,7 +337,7 @@ id = "J501"
 name = "no_executors_thread_pool"
 group = "concurrency"
 description = "禁止用 Executors 创建线程池（队列/线程数无界易 OOM），须用 ThreadPoolExecutor（规范 4.6【强制】）"
-script_path = "rules/J501_no_executors_thread_pool.yml"
+script_path = "config/rules-core/rules/J501_no_executors_thread_pool.yml"
 severity = "major"
 enabled = false
 
@@ -338,7 +346,7 @@ id = "J502"
 name = "no_static_dateformat"
 group = "concurrency"
 description = "SimpleDateFormat 等非线程安全 Format 不得定义为 static 变量（规范 4.6【强制】）"
-script_path = "rules/J502_no_static_dateformat.yml"
+script_path = "config/rules-core/rules/J502_no_static_dateformat.yml"
 severity = "major"
 enabled = false
 
@@ -347,7 +355,7 @@ id = "J503"
 name = "no_new_thread"
 group = "concurrency"
 description = "禁止显式 new Thread()，线程资源必须通过线程池提供（规范 4.6【强制】）"
-script_path = "rules/rhai/J503_no_new_thread.rhai"
+script_path = "config/rules-core/rules/rhai/J503_no_new_thread.rhai"
 severity = "major"
 enabled = false
 
@@ -358,7 +366,7 @@ id = "J510"
 name = "switch_must_have_default"
 group = "control"
 description = "switch 语句必须包含 default 分支（规范 4.7【强制】）"
-script_path = "rules/rhai/J510_switch_must_have_default.rhai"
+script_path = "config/rules-core/rules/rhai/J510_switch_must_have_default.rhai"
 severity = "major"
 enabled = false
 
@@ -367,7 +375,7 @@ id = "J511"
 name = "require_braces"
 group = "control"
 description = "if / 循环语句必须使用大括号，即使只有一行代码（规范 4.7【强制】）"
-script_path = "rules/rhai/J511_require_braces.rhai"
+script_path = "config/rules-core/rules/rhai/J511_require_braces.rhai"
 severity = "minor"
 enabled = false
 
@@ -378,7 +386,7 @@ id = "J601"
 name = "no_return_in_finally"
 group = "exception"
 description = "finally 块中禁止 return，会覆盖 try/catch 返回值并吞掉异常（规范 5【强制】）"
-script_path = "rules/rhai/J601_no_return_in_finally.rhai"
+script_path = "config/rules-core/rules/rhai/J601_no_return_in_finally.rhai"
 severity = "major"
 enabled = false
 
@@ -387,7 +395,7 @@ id = "J602"
 name = "no_generic_exception"
 group = "exception"
 description = "禁止直接创建/抛出 RuntimeException、Exception、Throwable，应使用业务自定义异常（规范 5【强制】）"
-script_path = "rules/rhai/J602_no_generic_exception.rhai"
+script_path = "config/rules-core/rules/rhai/J602_no_generic_exception.rhai"
 severity = "major"
 enabled = false
 
@@ -398,7 +406,7 @@ id = "J610"
 name = "log_must_use_placeholder"
 group = "logging"
 description = "日志输出必须使用占位符 {} 而非字符串拼接（规范 4.10【强制】）"
-script_path = "rules/rhai/J610_log_must_use_placeholder.rhai"
+script_path = "config/rules-spring/rules/rhai/J610_log_must_use_placeholder.rhai"
 severity = "minor"
 enabled = false
 
@@ -409,7 +417,7 @@ id = "J701"
 name = "no_componentscan_basepackages"
 group = "spring"
 description = "禁止 @ComponentScan 显式指定 basePackages 扩大扫描范围（规范 13.1）"
-script_path = "rules/J701_no_componentscan_basepackages.yml"
+script_path = "config/rules-spring/rules/J701_no_componentscan_basepackages.yml"
 severity = "major"
 enabled = false
 
@@ -418,6 +426,6 @@ id = "J702"
 name = "no_scanbasepackages"
 group = "spring"
 description = "禁止 @SpringBootApplication 显式指定 scanBasePackages 扩大扫描范围（规范 13.1）"
-script_path = "rules/J702_no_scanbasepackages.yml"
+script_path = "config/rules-spring/rules/J702_no_scanbasepackages.yml"
 severity = "major"
 enabled = false

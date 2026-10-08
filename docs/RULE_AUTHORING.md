@@ -329,6 +329,57 @@ vs
 > 要么失效的约束被忽略、规则退化成「匹配所有同类节点」而产生大量误报。
 
 
+## 团队规则包分发
+
+写好的规则要跨项目 / 跨团队复用时，把它组织成**规则包**（目录 + `rules-pack.toml` 清单），
+再通过 `rules add` 注册、`rules vendor` 入库：
+
+```text
+my-team-packs/
+├── rules-pack.toml     # 包清单
+└── rules/
+    ├── *.yml           # YAML 规则
+    └── rhai/*.rhai     # Rhai 规则
+```
+
+`rules-pack.toml` 最小示例：
+
+```toml
+[pack]
+name = "rules-spring"        # 包名，全局唯一
+version = "1.0.0"            # 包版本，独立于引擎版本演进
+api_version = 1              # 引擎 API 契约（硬闸门，不满足拒绝加载）
+engine = ">=0.1.7 <0.2"      # 引擎版本范围（软告警）
+# namespace = "spring"       # 可选：设置后包内规则 id 变为 <ns>:<id>（如 spring:J701）
+
+[[rules]]
+id = "J701"
+name = "no_componentscan_basepackages"
+group = "spring-convention"
+description = "禁止硬编码 @ComponentScan(basePackages)"
+script_path = "rules/J701_no_componentscan_basepackages.yml"   # 相对包根
+severity = "warning"
+enabled = false              # 团队包建议默认关闭，由各项目 overrides 按需开启
+```
+
+分发三步：
+
+```bash
+# 1) 注册到项目（先校验后写入：清单 / api_version / engine 契约 / 脚本逃逸全过闸，
+#    通过后写入 java-guard.toml 并自动刷新 javaguard.lock）
+java-guard rules add rules-spring --path ../team-packs/rules-spring
+
+# 2) 按需启用（overrides 用裸 id 即可跨包匹配）
+#    [[rule_packs.overrides]]
+#    id = "J701"
+#    enabled = true
+
+# 3) 入库（把生效的包复制到 vendor/rules/，随仓库提交，成员与 CI 免共享盘）
+java-guard rules vendor
+```
+
+包内规则、锁文件与 CI 严格校验（`rules verify --locked`）的完整说明见用户手册 3.2 节。
+
 ## 命令行覆盖
 
 ```bash

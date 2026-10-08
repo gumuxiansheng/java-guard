@@ -1,0 +1,68 @@
+# ================================================================================
+# 定制规则包 `rules-dep-security` 清单（依赖与 JSON 选型 — 团队技术栈定制规则的范例）
+# ================================================================================
+# 分层位置：通用规则见 config/rules-core/；本包只收「技术栈选型」相关规则
+# （JSON 框架 / 工具库约束），通过 namespace = "dep" 与通用包隔离
+# （包模式下生效规则 id 形如 dep:J010；过滤与 overrides 用规范 id 或裸 id 均可）。
+#
+# ★ 团队定制包默认全部 enabled = false，项目按需启用（不复制脚本）：
+#     [[rule_packs.overrides]]
+#     id = "dep:J010"        # 规范 id（dep:J010）或裸 id（J010）均可
+#     enabled = true
+# ★ severity / 脚本内容与 javaguard.rules.toml 保持一致（有守护测试防漂移）；
+#   example 中同 id 规则的 enabled 不适用（单文件旧布局默认全开，包模式按需开启）。
+# ================================================================================
+
+[pack]
+name        = "rules-dep-security"
+namespace   = "dep"
+version     = "1.0.0"
+api_version = 1
+engine      = ">=0.1.7 <0.2"
+description = "JavaGuard 依赖与 JSON 选型规则（fastjson 禁用 / jackson 统一 / commons-lang3）"
+license     = "MIT"
+
+[[rules]]
+id = "J010"
+name = "no_fastjson_import"
+group = "dependency-security"
+description = "禁止 import fastjson / fastjson2，推荐使用 jackson"
+script_path = "rules/J010_no_fastjson.yml"
+severity = "warning"
+enabled = false
+
+[[rules]]
+id = "J011"
+name = "commons_lang3_stringutils"
+group = "dependency-security"
+description = "StringUtils 应使用 org.apache.commons.lang3.StringUtils，不要自定义或使用其他实现"
+script_path = "rules/rhai/J011_stringutils.rhai"
+severity = "info"
+enabled = false
+
+[[rules]]
+id = "J012"
+name = "no_fastjson_usage"
+group = "dependency-security"
+description = "代码中禁止直接使用 fastjson / fastjson2 的类（如 JSONObject, JSONArray）"
+script_path = "rules/rhai/J012_fastjson_usage.rhai"
+severity = "warning"
+enabled = false
+
+[[rules]]
+id = "J014"
+name = "no_nonjackson_json_import"
+group = "dependency-security"
+description = "禁止引入非 jackson 的 JSON 框架（gson, org.json, net.sf.json 等）"
+script_path = "rules/J014_no_nonjackson_json.yml"
+severity = "warning"
+enabled = false
+
+[[rules]]
+id = "J015"
+name = "no_nonjackson_json_usage"
+group = "dependency-security"
+description = "代码中禁止使用非 jackson JSON 框架的类（如 Gson, JSONObject from org.json）"
+script_path = "rules/rhai/J015_nonjackson_json_usage.rhai"
+severity = "warning"
+enabled = false

@@ -1,0 +1,321 @@
+# ================================================================================
+# 通用规则包 `rules-core` 清单（与团队技术栈选型无关的 Java 通用规范）
+# ================================================================================
+# 规则分层（通用 / 定制分开分发）：
+#   config/rules-core/           ← 本包：通用规则（不设 namespace，对外 id 保持裸 J001 等）
+#   config/rules-dep-security/   ← 定制包：依赖与 JSON 选型（namespace = "dep"）
+#   config/rules-spring/         ← 定制包：Spring 与日志规约（namespace = "spring"）
+# 包根内结构：
+#   rules-pack.toml     ← 本清单（[pack] 元数据 + [[rules]]，与 javaguard.rules.toml 同格式）
+#   rules/*.yml         ← YAML 声明式规则（script_path 相对包根解析）
+#   rules/rhai/*.rhai   ← Rhai 脚本规则
+#
+# 与 javaguard.rules.toml 的关系：
+#   example 是「单文件旧布局」的镜像（引用 config/rules-*/rules/ 下的脚本），
+#   本清单与另外两个包清单的并集必须与 example 逐条一致（有守护测试
+#   pack_manifests_match_rules_example 防漂移）。
+#
+# 用法（项目侧）：
+#   [rule_packs]
+#   search_paths = ["vendor/rules"]
+#   packs = [{ name = "rules-core" }]
+#   # java-guard rules vendor  可把包复制进 vendor/rules/ 并固定 search_paths
+#   # java-guard rules lock    生成 javaguard.lock 供 CI --locked 校验
+#
+# ★ 收录标准：与具体技术栈选型、团队规范文档无关的 Java 语言级/业界共识规则
+#   才允许进入本包；技术栈相关规则一律放定制包（rules-dep-security / rules-spring）。
+# ★ enabled 与 javaguard.rules.toml 保持一致（本包是默认生效集）。
+# ================================================================================
+
+[pack]
+name        = "rules-core"
+version     = "1.0.0"
+api_version = 1
+engine      = ">=0.1.7 <0.2"
+description = "JavaGuard 通用规则集（命名 / 代码规范 / 潜在缺陷 / 格式 / OOP / 集合 / 并发 / 控制流 / 异常）"
+license     = "MIT"
+
+# ── 命名规范 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J004"
+name = "class_naming"
+group = "naming"
+description = "类名必须使用 PascalCase（大写驼峰）"
+script_path = "rules/J004_class_naming.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J005"
+name = "method_naming"
+group = "naming"
+description = "方法名必须使用 camelCase（小写驼峰）"
+script_path = "rules/J005_method_naming.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J007"
+name = "constant_naming"
+group = "naming"
+description = "常量（static final 字段）必须使用 UPPER_SNAKE_CASE"
+script_path = "rules/J007_constant_naming.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J101"
+name = "class_name_no_underscore_dollar"
+group = "naming"
+description = "类名与接口名不得以 _ 或 $ 开头或结尾（规范 4.1【强制】）"
+script_path = "rules/J101_class_name_no_underscore_dollar.yml"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J103"
+name = "no_pojo_suffix"
+group = "naming"
+description = "禁止将领域模型类命名为 xxxPOJO，应使用 DO/DTO/BO/VO 具体后缀（规范 4.1【参考】）"
+script_path = "rules/J103_no_pojo_suffix.yml"
+severity = "info"
+enabled = false
+
+[[rules]]
+id = "J104"
+name = "boolean_no_is_prefix"
+group = "naming"
+description = "POJO 布尔类型字段不得加 is 前缀，避免序列化属性名解析错误（规范 4.1【强制】）"
+script_path = "rules/J104_boolean_no_is_prefix.yml"
+severity = "major"
+enabled = false
+
+# ── 代码规范 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J001"
+name = "no_system_out"
+group = "code-style"
+description = "禁止使用 System.out / System.err 直接打印，请使用日志框架（SLF4J）"
+script_path = "rules/J001_no_system_out.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J003"
+name = "no_wildcard_import"
+group = "code-style"
+description = "import 不使用通配符（*），应明确导入具体类"
+script_path = "rules/J003_no_wildcard_import.yml"
+severity = "info"
+enabled = true
+
+[[rules]]
+id = "J006"
+name = "long_method"
+group = "code-style"
+description = "单个方法不超过 50 行（可通过 params 自定义阈值）"
+script_path = "rules/rhai/J006_long_method.rhai"
+severity = "info"
+enabled = true
+
+[rules.params]
+max_lines = 50
+
+# ── 潜在缺陷 ──────────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J008"
+name = "empty_catch"
+group = "potential-bug"
+description = "空 catch 块：catch 内部没有任何语句，会吞掉异常"
+script_path = "builtin:J008"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J009"
+name = "infinite_loop"
+group = "potential-bug"
+description = "潜在死循环：for(;;)、while(true)、或缺少更新条件的循环"
+script_path = "builtin:J009"
+severity = "warning"
+enabled = true
+
+[[rules]]
+id = "J016"
+name = "throw_must_log"
+group = "potential-bug"
+description = "catch 块中抛出异常前必须先通过 SLF4J 记录日志，禁止静默抛错"
+script_path = "builtin:J016"
+severity = "warning"
+enabled = true
+
+# ── 代码格式与排版（4.3）────────────────────────────────────────────────────
+
+[[rules]]
+id = "J201"
+name = "max_line_length"
+group = "format"
+description = "单行字符数不超过 120（规范 4.3【强制】）"
+script_path = "rules/rhai/J201_max_line_length.rhai"
+severity = "minor"
+enabled = false
+
+[rules.params]
+max_len = 120
+
+[[rules]]
+id = "J202"
+name = "no_tab_indent"
+group = "format"
+description = "缩进必须使用 4 个空格，禁止 tab 字符（规范 4.3【强制】）"
+script_path = "rules/rhai/J202_no_tab_indent.rhai"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J203"
+name = "no_trailing_whitespace"
+group = "format"
+description = "行尾不得有多余空白字符（规范 4.3）"
+script_path = "rules/rhai/J203_no_trailing_whitespace.rhai"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J204"
+name = "unix_line_ending"
+group = "format"
+description = "源文件必须使用 Unix 换行符 LF，不得使用 CRLF（规范 4.3【强制】）"
+script_path = "rules/rhai/J204_unix_line_ending.rhai"
+severity = "minor"
+enabled = false
+
+# ── OOP 与类型使用（4.4）────────────────────────────────────────────────────
+
+[[rules]]
+id = "J301"
+name = "no_bigdecimal_double"
+group = "oop"
+description = "禁止用 new BigDecimal(double) 构造，存在精度损失（规范 4.4【强制】）"
+script_path = "rules/rhai/J301_no_bigdecimal_double.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J302"
+name = "pojo_no_default_value"
+group = "oop"
+description = "POJO 类属性不得设置默认值（规范 4.4【强制】）"
+script_path = "rules/rhai/J302_pojo_no_default_value.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J303"
+name = "pojo_must_tostring"
+group = "oop"
+description = "POJO 类必须实现 toString（规范 4.4【强制】）"
+script_path = "rules/rhai/J303_pojo_must_tostring.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J304"
+name = "equals_hashcode_pair"
+group = "oop"
+description = "重写 equals 必须同时重写 hashCode（规范 4.5【强制】）"
+script_path = "rules/rhai/J304_equals_hashcode_pair.rhai"
+severity = "major"
+enabled = false
+
+# ── 集合处理（4.5）──────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J401"
+name = "no_collection_modify_in_foreach"
+group = "collection"
+description = "for-each 循环内禁止对集合做增删，会触发 ConcurrentModificationException（规范 4.5【强制】）"
+script_path = "rules/J401_no_collection_modify_in_foreach.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J402"
+name = "toarray_with_typed_array"
+group = "collection"
+description = "集合转数组必须使用 toArray(T[] array)（规范 4.5【强制】）"
+script_path = "rules/rhai/J402_toarray_with_typed_array.rhai"
+severity = "major"
+enabled = false
+
+# ── 并发与线程安全（4.6）────────────────────────────────────────────────────
+
+[[rules]]
+id = "J501"
+name = "no_executors_thread_pool"
+group = "concurrency"
+description = "禁止用 Executors 创建线程池（队列/线程数无界易 OOM），须用 ThreadPoolExecutor（规范 4.6【强制】）"
+script_path = "rules/J501_no_executors_thread_pool.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J502"
+name = "no_static_dateformat"
+group = "concurrency"
+description = "SimpleDateFormat 等非线程安全 Format 不得定义为 static 变量（规范 4.6【强制】）"
+script_path = "rules/J502_no_static_dateformat.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J503"
+name = "no_new_thread"
+group = "concurrency"
+description = "禁止显式 new Thread()，线程资源必须通过线程池提供（规范 4.6【强制】）"
+script_path = "rules/rhai/J503_no_new_thread.rhai"
+severity = "major"
+enabled = false
+
+# ── 控制语句（4.7）──────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J510"
+name = "switch_must_have_default"
+group = "control"
+description = "switch 语句必须包含 default 分支（规范 4.7【强制】）"
+script_path = "rules/rhai/J510_switch_must_have_default.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J511"
+name = "require_braces"
+group = "control"
+description = "if / 循环语句必须使用大括号，即使只有一行代码（规范 4.7【强制】）"
+script_path = "rules/rhai/J511_require_braces.rhai"
+severity = "minor"
+enabled = false
+
+# ── 异常处理（5）────────────────────────────────────────────────────────────
+
+[[rules]]
+id = "J601"
+name = "no_return_in_finally"
+group = "exception"
+description = "finally 块中禁止 return，会覆盖 try/catch 返回值并吞掉异常（规范 5【强制】）"
+script_path = "rules/rhai/J601_no_return_in_finally.rhai"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J602"
+name = "no_generic_exception"
+group = "exception"
+description = "禁止直接创建/抛出 RuntimeException、Exception、Throwable，应使用业务自定义异常（规范 5【强制】）"
+script_path = "rules/rhai/J602_no_generic_exception.rhai"
+severity = "major"
+enabled = false

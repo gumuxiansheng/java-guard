@@ -1,0 +1,68 @@
+# ================================================================================
+# 定制规则包 `rules-spring` 清单（Spring 与日志规约 — 团队技术栈定制规则）
+# ================================================================================
+# 分层位置：通用规则见 config/rules-core/；本包只收 Spring 框架与日志门面
+# 相关约定，通过 namespace = "spring" 与通用包隔离
+# （包模式下生效规则 id 形如 spring:J013；过滤与 overrides 用规范 id 或裸 id 均可）。
+#
+# ★ 团队定制包默认全部 enabled = false，项目按需启用（不复制脚本）：
+#     [[rule_packs.overrides]]
+#     id = "spring:J017"     # 规范 id（spring:J017）或裸 id（J017）均可
+#     enabled = true
+# ★ severity / 脚本内容与 javaguard.rules.toml 保持一致（有守护测试防漂移）；
+#   example 中同 id 规则的 enabled 不适用（单文件旧布局默认全开，包模式按需开启）。
+# ================================================================================
+
+[pack]
+name        = "rules-spring"
+namespace   = "spring"
+version     = "1.0.0"
+api_version = 1
+engine      = ">=0.1.7 <0.2"
+description = "JavaGuard Spring 与日志规约规则（Controller 参数 / 日志门面 / 占位符 / ComponentScan）"
+license     = "MIT"
+
+[[rules]]
+id = "J013"
+name = "controller_no_map_param"
+group = "spring-convention"
+description = "Spring Controller HTTP 接口禁止使用 Map 作为方法参数"
+script_path = "rules/rhai/J013_controller_no_map_param.rhai"
+severity = "warning"
+enabled = false
+
+[[rules]]
+id = "J017"
+name = "no_direct_log_impl"
+group = "code-style"
+description = "日志必须使用门面（SLF4J），禁止直接 import 具体日志实现（JUL / Log4j / Logback）"
+script_path = "rules/J017_no_direct_log_impl.yml"
+severity = "warning"
+enabled = false
+
+[[rules]]
+id = "J610"
+name = "log_must_use_placeholder"
+group = "logging"
+description = "日志输出必须使用占位符 {} 而非字符串拼接（规范 4.10【强制】）"
+script_path = "rules/rhai/J610_log_must_use_placeholder.rhai"
+severity = "minor"
+enabled = false
+
+[[rules]]
+id = "J701"
+name = "no_componentscan_basepackages"
+group = "spring"
+description = "禁止 @ComponentScan 显式指定 basePackages 扩大扫描范围（规范 13.1）"
+script_path = "rules/J701_no_componentscan_basepackages.yml"
+severity = "major"
+enabled = false
+
+[[rules]]
+id = "J702"
+name = "no_scanbasepackages"
+group = "spring"
+description = "禁止 @SpringBootApplication 显式指定 scanBasePackages 扩大扫描范围（规范 13.1）"
+script_path = "rules/J702_no_scanbasepackages.yml"
+severity = "major"
+enabled = false
